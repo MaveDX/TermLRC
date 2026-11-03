@@ -1,0 +1,23 @@
+[package]
+name = "termlrc"
+version = "0.1.0"
+edition = "2021"
+description = "A pure synced-lyrics terminal showcase with Kitty pixel-level scrolling, MPRIS, recursive LRC search, and remote synced lyric fallbacks"
+authors = ["TermLRC"]
+
+[dependencies]
+ab_glyph = "0.2"
+anyhow = "1.0"
+clap = { version = "4.5", features = ["derive", "env"] }
+crossterm = "0.28"
+epaint_default_fonts = "0.29"
+ratatui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+strsim = "0.11"
+toml = "0.8"
+unicode-width = "0.2"
+ureq = { version = "2.10", default-features = false, features = ["tls", "json"] }
+urlencoding = "2.1"
+walkdir = "2.5"
+zbus = "5"
