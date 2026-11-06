@@ -22,9 +22,9 @@ use crossterm::{
 };
 use kitty::KittyRenderer;
 use lrc::{LyricSyncState, ParsedLrc};
-use matcher::{LrcMatcher, TrackQuery};
+use matcher::{find_sibling_lrc, LrcMatcher, TrackQuery};
 use player::MprisTracker;
-use providers::{is_valid_synced_lrc, FallbackWorker};
+use providers::{is_valid_synced_lrc, retry_backoff_duration, FallbackWorker};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     io::{self, Write},
@@ -43,6 +43,8 @@ struct App {
     current_query: TrackQuery,
     current_track_length: Option<Duration>,
     current_lrc: Option<ParsedLrc>,
+    retry_attempt: u32,
+    next_retry_at: Option<Instant>,
 }
 
 impl App {
@@ -67,6 +69,8 @@ impl App {
             current_query: TrackQuery::default(),
             current_track_length: None,
             current_lrc: None,
+            retry_attempt: 0,
+            next_retry_at: None,
         }
     }
 
@@ -76,28 +80,49 @@ impl App {
 
     fn force_rescan_and_match(&mut self) {
         self.matcher.rescan();
-        self.match_current_track();
+        self.retry_attempt = 0;
+        self.next_retry_at = None;
+        self.match_current_track(true);
     }
 
-    fn match_current_track(&mut self) {
+    fn match_current_track(&mut self, preserve_existing_on_pending: bool) {
         self.kitty.invalidate();
         if self.current_query.is_empty() {
             self.current_lrc = None;
+            self.retry_attempt = 0;
+            self.next_retry_at = None;
             return;
         }
 
-        // 1. Try local recursive LRC folder first
-        if let Some(m) = self.matcher.find_best_match(&self.current_query) {
-            if let Ok(parsed) = ParsedLrc::from_file(&m.path) {
-                if is_valid_synced_lrc(&parsed) {
+        // 1. When a local audio file has a sibling `.lrc` file with the same name
+        //    (e.g. `song.flac` and `song.lrc`), use those lyrics without any network request.
+        if let Some(sibling_path) = find_sibling_lrc(&self.current_query) {
+            if let Ok(parsed) = ParsedLrc::from_file(&sibling_path) {
+                if !parsed.lines.is_empty() {
                     self.current_lrc = Some(parsed);
+                    self.retry_attempt = 0;
+                    self.next_retry_at = None;
                     return;
                 }
             }
         }
 
-        // 2. Local match failed or was unsynced: dispatch remote fallback chain in priority order
-        self.current_lrc = None;
+        // 2. Try local recursive LRC folder
+        if let Some(m) = self.matcher.find_best_match(&self.current_query) {
+            if let Ok(parsed) = ParsedLrc::from_file(&m.path) {
+                if is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty() {
+                    self.current_lrc = Some(parsed);
+                    self.retry_attempt = 0;
+                    self.next_retry_at = None;
+                    return;
+                }
+            }
+        }
+
+        // 3. Dispatch remote fallback chain in priority order
+        if !preserve_existing_on_pending {
+            self.current_lrc = None;
+        }
         let settings = self.settings_mgr.settings().clone();
         if !settings.enabled_fallback_providers().is_empty() {
             self.fallback_worker.request(
@@ -126,26 +151,67 @@ impl App {
                 .update_config(updated.player.clone(), updated.mpris_poll_ms);
             let new_dir = updated.resolved_lyrics_dir(&self.cli);
             if self.matcher.update_config(new_dir, updated.match_threshold) {
-                self.match_current_track();
+                self.match_current_track(true);
             }
         }
 
         let snap = self.tracker.update().clone();
         if snap.query != self.current_query {
+            let is_minor_update = self.current_query.is_same_track(
+                &snap.query,
+                self.current_track_length,
+                snap.length,
+            );
             self.current_query = snap.query.clone();
             self.current_track_length = snap.length;
-            self.ui.reset_for_new_track();
-            self.match_current_track();
+
+            // Small duration or album updates do not invalidate found lyrics
+            if is_minor_update && self.current_lrc.is_some() {
+                // Keep current_lrc intact
+            } else {
+                self.ui.reset_for_new_track();
+                self.retry_attempt = 0;
+                self.next_retry_at = None;
+                self.match_current_track(false);
+            }
         } else {
             self.current_track_length = snap.length;
         }
 
-        // Check if background fallback worker returned synced lyrics for the active track
+        // Check if background fallback worker completed a lookup for the active track
         if let Some(res) = self.fallback_worker.poll_response() {
-            if res.query == self.current_query && self.current_lrc.is_none() {
+            if res
+                .query
+                .is_same_track(&self.current_query, None, None)
+                || res.query == self.current_query
+            {
                 if let Some(lrc) = res.lrc {
                     self.current_lrc = Some(lrc);
+                    self.retry_attempt = 0;
+                    self.next_retry_at = None;
                     self.kitty.invalidate();
+                } else if self.current_lrc.is_none() {
+                    // Schedule exponential backoff retry: 30s -> 60s -> 120s -> ... -> 10m
+                    let delay = retry_backoff_duration(self.retry_attempt);
+                    self.retry_attempt = self.retry_attempt.saturating_add(1);
+                    self.next_retry_at = Some(Instant::now() + delay);
+                }
+            }
+        }
+
+        // Trigger scheduled retry if lookup previously failed and backoff timer elapsed
+        if self.current_lrc.is_none() && !self.current_query.is_empty() {
+            if let Some(retry_at) = self.next_retry_at {
+                if Instant::now() >= retry_at {
+                    self.next_retry_at = None;
+                    let settings = self.settings_mgr.settings().clone();
+                    if !settings.enabled_fallback_providers().is_empty() {
+                        self.fallback_worker.request(
+                            self.current_query.clone(),
+                            self.current_track_length,
+                            settings,
+                        );
+                    }
                 }
             }
         }

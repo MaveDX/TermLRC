@@ -11,30 +11,43 @@ const DEFAULT_CONFIG_TEMPLATE: &str = include_str!("../config.toml");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum FallbackProviderKind {
+    LrcMux,
+    LyricsPlus,
     LrcLib,
-    Musixmatch,
-    Spotify,
-    AppleMusic,
+    KuGou,
+    NetEase,
 }
 
 impl FallbackProviderKind {
     pub fn from_name(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
+            "lrcmux" | "lrc_mux" | "lrc-mux" => Some(Self::LrcMux),
+            "lyricsplus" | "lyrics_plus" | "lyrics-plus" | "kpoe" | "youly+" => {
+                Some(Self::LyricsPlus)
+            }
             "lrclib" | "lrc_lib" | "lrc-lib" => Some(Self::LrcLib),
-            "musixmatch" | "musicmxtch" | "mxm" => Some(Self::Musixmatch),
-            "spotify" => Some(Self::Spotify),
-            "apple_music" | "applemusic" | "apple-music" | "apple" => Some(Self::AppleMusic),
+            "kugou" | "ku_gou" | "ku-gou" => Some(Self::KuGou),
+            "netease"
+            | "netease_cloud_music"
+            | "netease-cloud-music"
+            | "neteasecloudmusic"
+            | "163" => Some(Self::NetEase),
             _ => None,
         }
     }
 
     pub fn display_name(self) -> &'static str {
         match self {
+            Self::LrcMux => "lrcmux",
+            Self::LyricsPlus => "LyricsPlus",
             Self::LrcLib => "LRCLIB",
-            Self::Musixmatch => "Musixmatch",
-            Self::Spotify => "Spotify",
-            Self::AppleMusic => "Apple Music",
+            Self::KuGou => "KuGou",
+            Self::NetEase => "NetEase Cloud Music",
         }
+    }
+
+    pub fn is_secondary_cjk_provider(self) -> bool {
+        matches!(self, Self::KuGou | Self::NetEase)
     }
 }
 
@@ -70,17 +83,15 @@ pub struct Settings {
     pub match_threshold: f64,
     pub fallback_match_threshold: f64,
     pub prefer_uncensored: bool,
+    pub enable_metadata_identify: bool,
     pub fallback_priority: Vec<String>,
+    pub enable_lrcmux: bool,
+    pub enable_lyricsplus: bool,
     pub enable_lrclib: bool,
-    pub enable_musixmatch: bool,
-    pub enable_spotify: bool,
-    pub enable_apple_music: bool,
-    pub musixmatch_token: String,
-    pub spotify_sp_dc: String,
-    pub spotify_api_url: String,
-    pub apple_music_bearer_token: String,
-    pub apple_music_media_user_token: String,
-    pub apple_music_api_url: String,
+    pub enable_kugou: bool,
+    pub enable_netease: bool,
+    pub lrcmux_api_url: String,
+    pub lyricsplus_api_url: String,
 }
 
 impl Default for Settings {
@@ -89,7 +100,7 @@ impl Default for Settings {
             lyrics_dir: None,
             player: None,
             kitty_graphics: true,
-            font_family: String::from("Noto Sans"),
+            font_family: String::from("Inter"),
             font_path: String::new(),
             fallback_fonts: vec![
                 String::from("Noto Sans CJK"),
@@ -101,9 +112,9 @@ impl Default for Settings {
                 String::from("DejaVu Sans"),
                 String::from("Unifont"),
             ],
-            font_size_active: 17.5,
-            font_size_inactive: 15.0,
-            pixel_line_spacing: 35.0,
+            font_size_active: 25.0,
+            font_size_inactive: 17.5,
+            pixel_line_spacing: 25.0,
             active_lyric_buffer_px: 18.0,
             inactive_lyric_buffer_px: 10.0,
             fps: 60,
@@ -113,7 +124,7 @@ impl Default for Settings {
             line_spacing: 2,
             active_lyric_buffer_rows: 1,
             offset_ms: 0,
-            alignment: String::from("center"),
+            alignment: String::from("left"),
             dim_inactive: true,
             dim_past_only: false,
             active_marker: String::new(),
@@ -123,22 +134,21 @@ impl Default for Settings {
             match_threshold: 0.62,
             fallback_match_threshold: 0.72,
             prefer_uncensored: true,
+            enable_metadata_identify: true,
             fallback_priority: vec![
+                String::from("lrcmux"),
+                String::from("lyricsplus"),
                 String::from("lrclib"),
-                String::from("musixmatch"),
-                String::from("spotify"),
-                String::from("apple_music"),
+                String::from("kugou"),
+                String::from("netease"),
             ],
+            enable_lrcmux: true,
+            enable_lyricsplus: true,
             enable_lrclib: true,
-            enable_musixmatch: true,
-            enable_spotify: false,
-            enable_apple_music: false,
-            musixmatch_token: String::new(),
-            spotify_sp_dc: String::new(),
-            spotify_api_url: String::new(),
-            apple_music_bearer_token: String::new(),
-            apple_music_media_user_token: String::new(),
-            apple_music_api_url: String::new(),
+            enable_kugou: true,
+            enable_netease: true,
+            lrcmux_api_url: String::new(),
+            lyricsplus_api_url: String::new(),
         }
     }
 }
@@ -171,10 +181,11 @@ impl Settings {
         for name in &self.fallback_priority {
             if let Some(kind) = FallbackProviderKind::from_name(name) {
                 let enabled = match kind {
+                    FallbackProviderKind::LrcMux => self.enable_lrcmux,
+                    FallbackProviderKind::LyricsPlus => self.enable_lyricsplus,
                     FallbackProviderKind::LrcLib => self.enable_lrclib,
-                    FallbackProviderKind::Musixmatch => self.enable_musixmatch,
-                    FallbackProviderKind::Spotify => self.enable_spotify,
-                    FallbackProviderKind::AppleMusic => self.enable_apple_music,
+                    FallbackProviderKind::KuGou => self.enable_kugou,
+                    FallbackProviderKind::NetEase => self.enable_netease,
                 };
                 if enabled && !out.contains(&kind) {
                     out.push(kind);
@@ -373,6 +384,16 @@ fn resolve_or_create_config_paths(custom: Option<&PathBuf>) -> Vec<PathBuf> {
     paths
 }
 
+pub fn data_cache_file_path() -> Option<PathBuf> {
+    let base = std::env::var("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|_| std::env::var("HOME").map(|h| PathBuf::from(h).join(".local").join("share")))
+        .ok()?;
+    let dir = base.join("termlrc");
+    let _ = fs::create_dir_all(&dir);
+    Some(dir.join("lyrics_cache.json"))
+}
+
 pub fn expand_tilde(path: &PathBuf) -> PathBuf {
     if let Some(s) = path.to_str() {
         if s == "~" {
@@ -402,18 +423,21 @@ mod tests {
 
         let mut custom = Settings::default();
         custom.fallback_priority = vec![
-            String::from("musixmatch"),
+            String::from("lrcmux"),
+            String::from("lyricsplus"),
             String::from("lrclib"),
-            String::from("spotify"),
+            String::from("kugou"),
         ];
-        custom.enable_musixmatch = true;
+        custom.enable_lrcmux = true;
+        custom.enable_lyricsplus = false;
         custom.enable_lrclib = true;
-        custom.enable_spotify = false;
+        custom.enable_kugou = true;
         assert_eq!(
             custom.enabled_fallback_providers(),
             vec![
-                FallbackProviderKind::Musixmatch,
-                FallbackProviderKind::LrcLib
+                FallbackProviderKind::LrcMux,
+                FallbackProviderKind::LrcLib,
+                FallbackProviderKind::KuGou,
             ]
         );
     }

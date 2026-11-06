@@ -1,5 +1,6 @@
 use crate::lrc::{LrcMetadata, ParsedLrc};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 use walkdir::WalkDir;
 
 /// Song information retrieved from MPRIS used to locate the matching LRC file.
@@ -24,37 +25,360 @@ impl TrackQuery {
         self.title.trim().is_empty() && self.url.is_none()
     }
 
-    /// Extract the 22-character base62 Spotify Track ID if `self.url` contains a Spotify
-    /// track URL (`https://open.spotify.com/track/<id>`), URI (`spotify:track:<id>`),
-    /// or MPRIS D-Bus object path (`/com/spotify/track/<id>`).
-    pub fn spotify_track_id(&self) -> Option<String> {
-        self.url.as_deref().and_then(extract_spotify_track_id)
+    /// Check if `other` refers to the same playing song (ignoring small duration or album updates).
+    pub fn is_same_track(&self, other: &Self, self_len: Option<Duration>, other_len: Option<Duration>) -> bool {
+        if self.is_empty() || other.is_empty() {
+            return false;
+        }
+        let same_title = normalize(&self.title) == normalize(&other.title);
+        let same_artist = normalize(&self.joined_artists()) == normalize(&other.joined_artists());
+        if !same_title || !same_artist {
+            return false;
+        }
+        if let (Some(a), Some(b)) = (self_len, other_len) {
+            if a.as_secs_f64() > 5.0 && b.as_secs_f64() > 5.0 {
+                if (a.as_secs_f64() - b.as_secs_f64()).abs() > 10.0 {
+                    return false;
+                }
+            }
+        }
+        true
     }
 }
 
-pub fn extract_spotify_track_id(raw: &str) -> Option<String> {
-    let trimmed = raw.trim();
-    let candidate = if let Some(rest) = trimmed.strip_prefix("spotify:track:") {
-        rest
-    } else if let Some(idx) = trimmed.find("/track/") {
-        &trimmed[idx + "/track/".len()..]
-    } else {
+/// Cleaned and decomposed metadata extracted from raw MPRIS / video-style track tags.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CleanedTrackMetadata {
+    /// Cleaned title (video suffixes like `(Official Video)` stripped, but featuring info may remain).
+    pub title: String,
+    /// Primary artist (extracted from embedded title or cleaned MPRIS artist).
+    pub artist: String,
+    /// Core song title with featuring/remix parentheticals stripped (e.g. `"Crazy"` from `"Crazy (feat. Yina)"`).
+    pub core_title: String,
+    /// Core artist with collaboration guests (`x Guest`, `feat. Guest`) and uploader channel names removed.
+    pub core_artist: String,
+    /// Album name if present and not identical to a video platform name.
+    pub album: Option<String>,
+    /// Original uploader / channel name if separated from an embedded artist in the video title.
+    pub uploader_channel: Option<String>,
+}
+
+impl CleanedTrackMetadata {
+    /// Return the stripped `"<song_title> <song_artist>"` search query leaving out the uploader's channel name
+    /// (for example `"Crazy chomin"` for `"Crazy (feat. Yina) by chomin"` from `"DJMAX ARCHIVE"`).
+    pub fn stripped_title_artist_query(&self) -> String {
+        let t = self.core_title.trim();
+        let a = self.core_artist.trim();
+        if !t.is_empty() && !a.is_empty() {
+            format!("{} {}", t, a)
+        } else if !t.is_empty() {
+            t.to_string()
+        } else {
+            a.to_string()
+        }
+    }
+
+    /// Whether the stripped `(core_title, core_artist)` differs meaningfully from `(title, artist)` or raw MPRIS tags.
+    pub fn has_distinct_stripped_query(&self, raw: &TrackQuery) -> bool {
+        let raw_ar = raw.primary_artist().unwrap_or("");
+        self.uploader_channel.is_some()
+            || normalize(&self.core_title) != normalize(&self.title)
+            || normalize(&self.core_artist) != normalize(&self.artist)
+            || (!raw_ar.is_empty() && normalize(&self.core_artist) != normalize(raw_ar))
+    }
+}
+
+/// Check if `query.url` points to a local audio file that has a sibling `.lrc` file with the same stem
+/// in the exact same directory (e.g. `/path/to/song.flac` -> `/path/to/song.lrc`).
+pub fn find_sibling_lrc(query: &TrackQuery) -> Option<PathBuf> {
+    let raw_url = query.url.as_deref()?.trim();
+    if raw_url.is_empty()
+        || raw_url.starts_with("http://")
+        || raw_url.starts_with("https://")
+        || raw_url.starts_with("spotify:")
+        || raw_url.starts_with("/org/mpris/")
+    {
         return None;
+    }
+
+    let path_part = raw_url.strip_prefix("file://").unwrap_or(raw_url);
+    let decoded = urlencoding::decode(path_part).ok()?;
+    let audio_path = Path::new(decoded.as_ref());
+
+    // Direct `<stem>.lrc` check
+    let direct_lrc = audio_path.with_extension("lrc");
+    if direct_lrc.is_file() {
+        return Some(direct_lrc);
+    }
+    let upper_lrc = audio_path.with_extension("LRC");
+    if upper_lrc.is_file() {
+        return Some(upper_lrc);
+    }
+
+    // Case-insensitive stem check in the same directory
+    let parent = audio_path.parent()?;
+    let stem = audio_path.file_stem()?.to_str()?;
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let p = entry.path();
+            if !p.is_file() {
+                continue;
+            }
+            let is_lrc = p
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("lrc"))
+                .unwrap_or(false);
+            if is_lrc {
+                if let Some(s) = p.file_stem().and_then(|s| s.to_str()) {
+                    if s.eq_ignore_ascii_case(stem) {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    }
+
+    None
+}
+
+/// Clean up video-style metadata (such as `Artist x Guest - Song (Official Video)` titles,
+/// `Crazy (feat. Yina) by chomin` titles, and uploader channel names).
+pub fn clean_video_metadata(query: &TrackQuery) -> CleanedTrackMetadata {
+    let raw_title = query.title.trim();
+    let raw_artist = query.primary_artist().unwrap_or("").trim();
+
+    let mut working_title = strip_video_tags(raw_title);
+    let mut extracted_artist: Option<String> = None;
+    let mut uploader_channel: Option<String> = None;
+
+    // 1. Check for `"<Song> by <Artist>"` pattern (e.g. `"Crazy (feat. Yina) by chomin"`)
+    if let Some((song_part, by_artist)) = split_by_artist_suffix(&working_title) {
+        let new_title = song_part.to_string();
+        let new_artist = by_artist.to_string();
+        if !raw_artist.is_empty() && normalize(raw_artist) != normalize(&new_artist) {
+            uploader_channel = Some(raw_artist.to_string());
+        }
+        working_title = new_title;
+        extracted_artist = Some(new_artist);
+    } else if let Some((left_artist, right_song)) = split_embedded_artist_title(&working_title, raw_artist) {
+        // 2. Check for `"<Artist> - <Song>"` embedded in video title
+        //    (e.g. `"Artist x Guest - Song (Official Video)"`)
+        let new_title = strip_video_tags(right_song);
+        let new_artist = left_artist.to_string();
+        if !raw_artist.is_empty() && normalize(raw_artist) != normalize(&new_artist) {
+            uploader_channel = Some(raw_artist.to_string());
+        }
+        working_title = new_title;
+        extracted_artist = Some(new_artist);
+    }
+
+    let full_artist = match extracted_artist {
+        Some(ref ar) => clean_channel_suffix(ar),
+        None => clean_channel_suffix(raw_artist),
     };
 
-    let id: String = candidate
-        .split(|c: char| c == '?' || c == '/' || c == '#' || c.is_whitespace())
-        .next()
-        .unwrap_or("")
-        .chars()
-        .take_while(|c| c.is_ascii_alphanumeric())
-        .collect();
+    let core_title = strip_featuring_and_decorations(&working_title);
+    let core_artist = extract_primary_collab_artist(&full_artist);
 
-    if id.len() == 22 {
-        Some(id)
-    } else {
-        None
+    let album = query
+        .album
+        .as_deref()
+        .map(str::trim)
+        .filter(|a| !a.is_empty() && !is_generic_video_album(a))
+        .map(String::from);
+
+    CleanedTrackMetadata {
+        title: if working_title.is_empty() {
+            raw_title.to_string()
+        } else {
+            working_title
+        },
+        artist: full_artist,
+        core_title: if core_title.is_empty() {
+            raw_title.to_string()
+        } else {
+            core_title
+        },
+        core_artist,
+        album,
+        uploader_channel,
     }
+}
+
+fn strip_video_tags(input: &str) -> String {
+    const VIDEO_KEYWORDS: &[&str] = &[
+        "official video",
+        "official music video",
+        "official audio",
+        "official lyric video",
+        "official lyrics",
+        "official visualizer",
+        "official mv",
+        "music video",
+        "lyric video",
+        "lyrics video",
+        "visualizer",
+        "full audio",
+        "audio only",
+        "m/v",
+        "mv",
+        "hd",
+        "4k",
+        "hq",
+        "1080p",
+        "720p",
+    ];
+
+    let mut out = String::with_capacity(input.len());
+    let chars: Vec<char> = input.chars().collect();
+    let mut i = 0;
+    while i < chars.len() {
+        let open = chars[i];
+        let close = match open {
+            '(' => Some(')'),
+            '[' => Some(']'),
+            '【' => Some('】'),
+            _ => None,
+        };
+        if let Some(close_ch) = close {
+            if let Some(rel_end) = chars[i + 1..].iter().position(|&c| c == close_ch) {
+                let inside: String = chars[i + 1..i + 1 + rel_end].iter().collect();
+                let inside_low = inside.trim().to_ascii_lowercase();
+                let is_video_noise = VIDEO_KEYWORDS.iter().any(|&kw| {
+                    inside_low == kw
+                        || inside_low.starts_with(&format!("{} ", kw))
+                        || inside_low.ends_with(&format!(" {}", kw))
+                        || (kw.len() >= 5 && inside_low.contains(kw))
+                });
+                if is_video_noise {
+                    i += rel_end + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(open);
+        i += 1;
+    }
+
+    // Also strip trailing `- Official Video`, `| Official Music Video`, etc.
+    let mut cleaned = out.trim().to_string();
+    for sep in [" - ", " | ", " // ", " / "] {
+        if let Some((left, right)) = cleaned.rsplit_once(sep) {
+            let right_low = right.trim().to_ascii_lowercase();
+            if VIDEO_KEYWORDS.iter().any(|&kw| right_low == kw || (kw.len() >= 5 && right_low.contains(kw))) {
+                cleaned = left.trim().to_string();
+            }
+        }
+    }
+
+    cleaned.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn split_by_artist_suffix(title: &str) -> Option<(&str, &str)> {
+    // Match case-insensitive `" by "` near the end of the title (outside parentheses)
+    let lower = title.to_ascii_lowercase();
+    let idx = lower.rfind(" by ")?;
+    let left = title[..idx].trim();
+    let right = title[idx + 4..].trim();
+    if left.is_empty()
+        || right.is_empty()
+        || left.contains('(') && !left.contains(')')
+        || right.contains(')')
+    {
+        return None;
+    }
+    Some((left, right))
+}
+
+fn split_embedded_artist_title<'a>(title: &'a str, raw_artist: &str) -> Option<(&'a str, &'a str)> {
+    for sep in [" - ", " – ", " — "] {
+        if let Some((left, right)) = title.split_once(sep) {
+            let l = left.trim();
+            let r = right.trim();
+            if !l.is_empty() && !r.is_empty() && !l.chars().all(|c| c.is_ascii_digit()) {
+                // Avoid splitting if the right side is just a remix/remaster tag
+                let r_low = r.to_ascii_lowercase();
+                if r_low.starts_with("remaster")
+                    || r_low.starts_with("live")
+                    || r_low.starts_with("radio edit")
+                    || r_low.starts_with("single")
+                {
+                    continue;
+                }
+                let _ = raw_artist;
+                return Some((l, r));
+            }
+        }
+    }
+    None
+}
+
+fn clean_channel_suffix(artist: &str) -> String {
+    let mut s = artist.trim().to_string();
+    for suffix in [
+        " - Topic",
+        " - topic",
+        " Official Channel",
+        " Official",
+        "VEVO",
+        "vevo",
+    ] {
+        if let Some(stripped) = s.strip_suffix(suffix) {
+            let trimmed = stripped.trim();
+            if !trimmed.is_empty() {
+                s = trimmed.to_string();
+            }
+        }
+    }
+    s
+}
+
+fn strip_featuring_and_decorations(title: &str) -> String {
+    let base = strip_decorations(title);
+    let lower = base.to_ascii_lowercase();
+    for marker in [" feat.", " feat ", " ft.", " ft ", " with ", " prod."] {
+        if let Some(idx) = lower.find(marker) {
+            if idx > 0 {
+                return base[..idx].trim().to_string();
+            }
+        }
+    }
+    base.trim().to_string()
+}
+
+fn extract_primary_collab_artist(artist: &str) -> String {
+    let base = strip_decorations(artist);
+    let lower = base.to_ascii_lowercase();
+    for sep in [
+        " feat.",
+        " feat ",
+        " ft.",
+        " ft ",
+        " x ",
+        " × ",
+        " vs.",
+        " vs ",
+        " with ",
+        ", ",
+        " & ",
+    ] {
+        if let Some(idx) = lower.find(sep) {
+            let first = base[..idx].trim();
+            if !first.is_empty() {
+                return first.to_string();
+            }
+        }
+    }
+    base.trim().to_string()
+}
+
+fn is_generic_video_album(album: &str) -> bool {
+    let low = album.trim().to_ascii_lowercase();
+    matches!(
+        low.as_str(),
+        "youtube" | "youtube music" | "soundcloud" | "bilibili" | "nicovideo" | "vimeo"
+    )
 }
 
 /// An indexed `.lrc` file discovered during recursive directory traversal.
@@ -175,10 +499,18 @@ impl LrcMatcher {
     }
 
     /// Find the best matching `.lrc` file for the given track query.
-    /// If not found in the current index, rescans the directory once in case new files were added.
+    /// First checks if the local audio file has a direct sibling `.lrc` file with the same name.
+    /// Otherwise searches the indexed directory (rescanning once if needed).
     pub fn find_best_match(&mut self, query: &TrackQuery) -> Option<MatchResult> {
         if query.is_empty() {
             return None;
+        }
+
+        if let Some(sibling) = find_sibling_lrc(query) {
+            return Some(MatchResult {
+                path: sibling,
+                score: 1.0,
+            });
         }
 
         if let Some(res) = self.search_indexed(query) {
@@ -578,20 +910,55 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_spotify_track_id() {
-        assert_eq!(
-            extract_spotify_track_id("https://open.spotify.com/track/4cOdK2wGLETKBW3PvgPWqT?si=123"),
-            Some("4cOdK2wGLETKBW3PvgPWqT".to_string())
-        );
-        assert_eq!(
-            extract_spotify_track_id("spotify:track:4cOdK2wGLETKBW3PvgPWqT"),
-            Some("4cOdK2wGLETKBW3PvgPWqT".to_string())
-        );
-        assert_eq!(
-            extract_spotify_track_id("/com/spotify/track/4cOdK2wGLETKBW3PvgPWqT"),
-            Some("4cOdK2wGLETKBW3PvgPWqT".to_string())
-        );
-        assert_eq!(extract_spotify_track_id("file:///mnt/music/song.flac"), None);
+    fn test_sibling_lrc_and_video_metadata_cleanup() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("termlrc_sibling_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let audio = temp_dir.join("song.flac");
+        let sibling = temp_dir.join("song.lrc");
+        fs::write(&audio, b"fake audio").unwrap();
+        fs::write(&sibling, "[00:01.00]Sibling line 1\n[00:03.00]Sibling line 2").unwrap();
+
+        let q_sib = TrackQuery {
+            title: "Unrelated Title".to_string(),
+            artists: vec![],
+            album: None,
+            url: Some(format!("file://{}", audio.display())),
+        };
+        assert_eq!(find_sibling_lrc(&q_sib), Some(sibling));
+        let _ = fs::remove_dir_all(&temp_dir);
+
+        // Video metadata cleanup 1: "Crazy (feat. Yina) by chomin" from "DJMAX ARCHIVE"
+        let q_djmax = TrackQuery {
+            title: "Crazy (feat. Yina) by chomin".to_string(),
+            artists: vec!["DJMAX ARCHIVE".to_string()],
+            album: None,
+            url: None,
+        };
+        let cleaned = clean_video_metadata(&q_djmax);
+        assert_eq!(cleaned.title, "Crazy (feat. Yina)");
+        assert_eq!(cleaned.artist, "chomin");
+        assert_eq!(cleaned.core_title, "Crazy");
+        assert_eq!(cleaned.core_artist, "chomin");
+        assert_eq!(cleaned.uploader_channel.as_deref(), Some("DJMAX ARCHIVE"));
+        assert_eq!(cleaned.stripped_title_artist_query(), "Crazy chomin");
+
+        // Video metadata cleanup 2: "Artist x Guest - Song (Official Video)"
+        let q_collab = TrackQuery {
+            title: "Artist x Guest - Song (Official Video)".to_string(),
+            artists: vec!["Some Uploader Channel".to_string()],
+            album: Some("YouTube".to_string()),
+            url: None,
+        };
+        let cleaned2 = clean_video_metadata(&q_collab);
+        assert_eq!(cleaned2.title, "Song");
+        assert_eq!(cleaned2.artist, "Artist x Guest");
+        assert_eq!(cleaned2.core_title, "Song");
+        assert_eq!(cleaned2.core_artist, "Artist");
+        assert_eq!(cleaned2.album, None);
+        assert_eq!(cleaned2.stripped_title_artist_query(), "Song Artist");
     }
 }
 

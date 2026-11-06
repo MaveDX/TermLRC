@@ -1,11 +1,16 @@
 use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::Read;
 use std::path::Path;
 use std::time::Duration;
 
+fn default_true() -> bool {
+    true
+}
+
 /// Metadata extracted from LRC header tags (`[ti:]`, `[ar:]`, `[al:]`, `[offset:]`).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LrcMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
@@ -15,28 +20,42 @@ pub struct LrcMetadata {
 }
 
 /// Optional word/segment timestamp inside an Enhanced LRC line (`<mm:ss.xx>text`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TimedSegment {
     pub timestamp: Duration,
     pub text: String,
 }
 
 /// A single timestamped lyric line.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LyricLine {
     pub timestamp: Duration,
     pub text: String,
     pub segments: Vec<TimedSegment>,
 }
 
-/// Parsed LRC file containing metadata and sorted synced lyric lines.
-#[derive(Debug, Clone, Default)]
+/// Parsed LRC file containing metadata and sorted synced (or plain-text fallback) lyric lines.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedLrc {
     pub metadata: LrcMetadata,
     pub lines: Vec<LyricLine>,
     /// Optional banner displayed at the top of the lyric sheet when fetched from a fallback provider
-    /// (e.g. `Some("Lyrics from LRCLIB")`).
+    /// (e.g. `Some("Lyrics from lrcmux")`).
     pub source_label: Option<String>,
+    /// Whether these lyrics have real line timestamps (`true`) or are unsynced plain text (`false`).
+    #[serde(default = "default_true")]
+    pub is_synced: bool,
+}
+
+impl Default for ParsedLrc {
+    fn default() -> Self {
+        Self {
+            metadata: LrcMetadata::default(),
+            lines: Vec::new(),
+            source_label: None,
+            is_synced: true,
+        }
+    }
 }
 
 /// State of the lyric playback at a specific song position.
@@ -54,12 +73,19 @@ pub struct LyricSyncState {
 }
 
 impl ParsedLrc {
-    /// Parse an LRC file from disk.
+    /// Parse an LRC file from disk (supports both synced LRC and plain-text `.lrc` sidecar files).
     pub fn from_file(path: &Path) -> Result<Self> {
         let bytes = fs::read(path)
             .with_context(|| format!("Failed to read LRC file: {}", path.display()))?;
         let content = String::from_utf8_lossy(&bytes);
-        Ok(Self::parse(&content))
+        let parsed = Self::parse(&content);
+        if parsed.lines.len() >= 2 {
+            Ok(parsed)
+        } else {
+            let mut plain = Self::from_plain_text(&content);
+            plain.metadata = parsed.metadata;
+            Ok(plain)
+        }
     }
 
     /// Read only the metadata headers from an LRC file quickly for indexing/matching
@@ -115,6 +141,35 @@ impl ParsedLrc {
             metadata,
             lines,
             source_label: None,
+            is_synced: true,
+        }
+    }
+
+    /// Parse unsynced plain-text lyrics (used only when nothing is synced).
+    pub fn from_plain_text(content: &str) -> Self {
+        let content = content.strip_prefix('\u{feff}').unwrap_or(content);
+        let mut metadata = LrcMetadata::default();
+        let mut lines = Vec::new();
+        for raw_line in content.lines() {
+            let trimmed = raw_line.trim();
+            if trimmed.starts_with('[') && trimmed.ends_with(']') && trimmed.contains(':') {
+                parse_metadata_tag(trimmed, &mut metadata);
+                continue;
+            }
+            if trimmed.is_empty() {
+                continue;
+            }
+            lines.push(LyricLine {
+                timestamp: Duration::ZERO,
+                text: trimmed.to_string(),
+                segments: Vec::new(),
+            });
+        }
+        Self {
+            metadata,
+            lines,
+            source_label: None,
+            is_synced: false,
         }
     }
 
@@ -123,7 +178,7 @@ impl ParsedLrc {
     /// `user_offset_ms`: positive values delay lyrics (shift timestamps later),
     /// negative values advance lyrics (shift timestamps earlier).
     pub fn sync_state(&self, position: Duration, user_offset_ms: i64) -> LyricSyncState {
-        if self.lines.is_empty() {
+        if self.lines.is_empty() || !self.is_synced {
             return LyricSyncState {
                 active_index: None,
                 line_progress: 0.0,

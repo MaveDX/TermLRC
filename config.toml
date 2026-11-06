@@ -113,30 +113,25 @@ match_threshold = 0.62
 # Minimum confidence score (0.1 - 0.99) required to accept a remote fallback lyric match
 fallback_match_threshold = 0.72
 
-# Prioritise uncensored/explicit lyrics over censored ("f**k", "clean", "radio edit") versions.
-# Note: Unsynced (plain text) lyrics are ALWAYS rejected across all fallback providers.
+# Prioritise uncensored/explicit lyrics over censored ("f**k", "clean", "radio edit") versions
 prefer_uncensored = true
 
+# Clean up video-style metadata and identify canonical recording via Deezer and MusicBrainz
+enable_metadata_identify = true
+
 # Priority order of remote fallback providers when local .lrc search fails.
-# Rearrange this list to change the lookup priority order.
-# Valid providers: "lrclib", "musixmatch", "spotify", "apple_music"
-fallback_priority = ["spotify", "apple_music", "musixmatch", "lrclib"]
+# Valid providers: "lrcmux", "lyricsplus", "lrclib", "kugou", "netease"
+# Note: KuGou and NetEase are queried only when none of the earlier providers
+# has synced lyrics timed for a recording of the playing length.
+fallback_priority = ["lrcmux", "lyricsplus", "lrclib", "kugou", "netease"]
 
 # Individual toggles for each remote fallback provider
+enable_lrcmux = true
+enable_lyricsplus = true
 enable_lrclib = true
-enable_musixmatch = true
-enable_spotify = true
-enable_apple_music = true
+enable_kugou = true
+enable_netease = true
 
-# Optional credentials / custom endpoints for providers that require authentication:
-# Musixmatch usertoken (if empty, TermLRC automatically requests an anonymous desktop token)
-musixmatch_token = ""
-
-# Spotify sp_dc cookie or custom spotify-lyrics-api endpoint URL
-spotify_sp_dc = ""
-spotify_api_url = ""
-
-# Apple Music developer bearer token + Media-User-Token (or custom syllable/TTML proxy URL)
-apple_music_bearer_token = ""
-apple_music_media_user_token = ""
-apple_music_api_url = ""
+# Optional custom base URLs for self-hosted lrcmux or LyricsPlus instances
+lrcmux_api_url = ""
+lyricsplus_api_url = ""

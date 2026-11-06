@@ -1,36 +1,33 @@
 # TermLRC
 
-**TermLRC** is a lightweight, synced-lyrics terminal showcase written in Rust. It listens to **MPRIS2** over D-Bus to track your currently playing song and playback position, searches a local music directory recursively for matching `.lrc` files, and optionally falls back to remote synced lyric providers (**Spotify**, **Apple Music**, **Musixmatch**, **LRCLIB**).
+**TermLRC** is a lightweight, synced-lyrics terminal showcase written in Rust. It listens to **MPRIS2** over D-Bus to track your currently playing song and playback position, and resolves lyrics through a multi-stage local and remote pipeline.
 
-## Features
+## Lyric Sourcing Pipeline
 
-- **Pixel-Level Smooth Scrolling (Kitty Graphics Protocol)**
-  - Renders vector fonts (`ab_glyph`) onto a transparent RGBA canvas (`f=32`) sized to your terminal's exact pixel geometry (`TIOCGWINSZ`), preserving your terminal's native background color, opacity, and blur.
-  - Focus-invariant line wrapping and guaranteed non-overlapping vertical buffers (`active_lyric_buffer_px`, `inactive_lyric_buffer_px`) so lyrics never warp or collide when focused.
-  - Press `x` at any time to toggle between Kitty pixel-scrolling mode and standard text TUI mode.
-- **Configurable Fonts & Lazy CJK Fallback**
-  - Supports any installed proportional or monospace font (`font_family = "Inter"`, `"Maple Mono NF"`, `"Noto Sans"`, etc.) or direct `font_path`, with on-demand fallback (`fallback_fonts`) for Japanese, Chinese, Korean, and Unicode symbols while keeping idle RAM usage around ~1–2 MB.
-- **Local Recursive `.lrc` Search + Remote Synced Fallbacks**
-  - Searches your local music folder first (`match_threshold = 0.62`), then queries enabled fallback providers in your configured `fallback_priority` order (`fallback_match_threshold = 0.72`).
-  - **Synced-Only & Uncensored Priority**: Rejects unsynced/plain-text lyrics and prioritizes explicit/uncensored lyrics over censored (`f**k`, `***`, `Clean`, `Radio Edit`) versions (`prefer_uncensored = true`).
-  - Displays a scrollable `"Lyrics from <Provider>"` attribution header above the first line when a remote fallback provider is used.
-  - Built-in per-provider rate limiting, token caching, and session LRU lyric caching.
+1. **Direct Sibling `.lrc` & Local Folder Search**
+   - When a local audio file has a sibling `.lrc` file with the same name (for example `song.flac` and `song.lrc`), those lyrics are used immediately without any network request.
+   - Otherwise, TermLRC searches your configured local `lyrics_dir` recursively (`match_threshold = 0.62`).
+2. **Video-Style Metadata Cleanup & Recording Identification**
+   - Cleans up video-style metadata (such as `Artist x Guest - Song (Official Video)` titles and uploader channel names) and identifies the canonical recording through [Deezer](https://www.deezer.com/) and [MusicBrainz](https://musicbrainz.org/).
+3. **Ordered Remote Providers & Line-by-Line Consensus**
+   - Queries enabled providers in order:
+     1. [lrcmux](https://lrcmux.dev/)
+     2. [LyricsPlus](https://github.com/ibratabian17/lyricsplus)
+     3. [LRCLIB](https://lrclib.net/)
+     4. [KuGou](https://www.kugou.com/) and [NetEase Cloud Music](https://music.163.com/), queried **only** when none of the above has synced lyrics timed for a recording of the playing length.
+   - When LRCLIB, KuGou, or NetEase finds nothing for the full metadata, it is searched once more with just the song title and its artist, leaving out the uploader's channel name (for example `Crazy chomin` for a `Crazy (feat. Yina) by chomin` video from the `DJMAX ARCHIVE` channel).
+   - **Length Match & Cross-Source Line Consensus**: Lyrics timed for a recording whose length matches the playing track are preferred. When none match, the synced lyrics from every source that has them are compared line by line, and the version whose line timings the other sources confirm wins (ties go to the earlier source in the list). Plain text is used only when nothing is synced. Recordings up to 30 seconds longer or shorter than the playing track are still matched; ambiguous or unrelated recordings are rejected.
+4. **Persistent Caching, Stability & Backoff**
+   - Results are cached in memory and in `~/.local/share/termlrc/lyrics_cache.json` (`$XDG_DATA_HOME/termlrc/lyrics_cache.json`), so restarts do not repeat lookups.
+   - Small duration or album updates do not invalidate found lyrics, and temporary failures keep the last lyrics for the unchanged track visible.
+   - Providers that fail or rate-limit are skipped for a cooldown period, and failed lookups are retried after 30 seconds with doubling delays up to 10 minutes.
 
 ## Usage
 
 ### Nix Flake
 
-Run directly without installing:
-
 ```bash
 nix run github:MaveDX/TermLRC -- /path/to/music
-```
-
-Or build locally:
-
-```bash
-nix build
-./result/bin/termlrc /path/to/music
 ```
 
 ### Cargo
@@ -41,13 +38,6 @@ cargo build --release
 ```
 
 ## Configuration (`config.toml`)
-
-TermLRC automatically creates and live-reloads `config.toml` while running. It checks:
-1. `--config <PATH>` (or `TERMLRC_CONFIG`)
-2. `./config.toml`
-3. `~/.config/termlrc/config.toml`
-
-Key settings in [`config.toml`](config.toml):
 
 ```toml
 # Default folder to search recursively for .lrc files
@@ -61,32 +51,18 @@ font_size_inactive = 17.5
 pixel_line_spacing = 25.0
 active_lyric_buffer_px = 18.0
 inactive_lyric_buffer_px = 10.0
-alignment = "left" # "left", "center", or "right"
+alignment = "left"
 
 # Matching & Remote Fallbacks
 match_threshold = 0.62
 fallback_match_threshold = 0.72
 prefer_uncensored = true
-fallback_priority = ["spotify", "apple_music", "musixmatch", "lrclib"]
+enable_metadata_identify = true
+fallback_priority = ["lrcmux", "lyricsplus", "lrclib", "kugou", "netease"]
 
+enable_lrcmux = true
+enable_lyricsplus = true
 enable_lrclib = true
-enable_musixmatch = true
-enable_spotify = true
-enable_apple_music = true
-
-# Optional provider credentials (e.g. Spotify web cookie `sp_dc` from open.spotify.com)
-spotify_sp_dc = ""
+enable_kugou = true
+enable_netease = true
 ```
-
-## Keybindings
-
-| Key | Action |
-| --- | --- |
-| `q` / `Esc` | Quit |
-| `x` | Toggle Kitty Graphics pixel-scrolling / Text TUI mode |
-| `k` | Toggle karaoke word/line sweep highlight |
-| `g` | Toggle continuous vertical glide vs. smooth step scroll |
-| `c` | Cycle alignment (`left` / `center` / `right`) |
-| `[` / `]` | Adjust lyric timing offset (`-50ms` / `+50ms`, `0` to reset) |
-| `-` / `+` | Adjust scroll damping speed |
-| `r` | Re-scan local `.lrc` directory and remote fallbacks |
