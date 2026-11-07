@@ -53,4 +53,8 @@ pub struct Cli {
     /// Enable or disable karaoke-style highlight sweep (overrides config.toml).
     #[arg(short = 'k', long = "karaoke")]
     pub karaoke: Option<bool>,
+
+    /// Save fetched remote lyrics as a `.lrc` sidecar file next to the matching local song file (overrides config.toml).
+    #[arg(long = "save-lrc-file", alias = "save-sidecar")]
+    pub save_lrc_file: Option<bool>,
 }

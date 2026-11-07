@@ -88,9 +88,8 @@ impl CleanedTrackMetadata {
     }
 }
 
-/// Check if `query.url` points to a local audio file that has a sibling `.lrc` file with the same stem
-/// in the exact same directory (e.g. `/path/to/song.flac` -> `/path/to/song.lrc`).
-pub fn find_sibling_lrc(query: &TrackQuery) -> Option<PathBuf> {
+/// Resolve `query.url` to a local filesystem audio path if it points to a local file.
+pub fn resolve_local_audio_path(query: &TrackQuery) -> Option<PathBuf> {
     let raw_url = query.url.as_deref()?.trim();
     if raw_url.is_empty()
         || raw_url.starts_with("http://")
@@ -104,6 +103,17 @@ pub fn find_sibling_lrc(query: &TrackQuery) -> Option<PathBuf> {
     let path_part = raw_url.strip_prefix("file://").unwrap_or(raw_url);
     let decoded = urlencoding::decode(path_part).ok()?;
     let audio_path = Path::new(decoded.as_ref());
+    if audio_path.is_file() || audio_path.parent().map_or(false, |p| p.is_dir()) {
+        Some(audio_path.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// Check if `query.url` points to a local audio file that has a sibling `.lrc` file with the same stem
+/// in the exact same directory (e.g. `/path/to/song.flac` -> `/path/to/song.lrc`).
+pub fn find_sibling_lrc(query: &TrackQuery) -> Option<PathBuf> {
+    let audio_path = resolve_local_audio_path(query)?;
 
     // Direct `<stem>.lrc` check
     let direct_lrc = audio_path.with_extension("lrc");
@@ -550,6 +560,151 @@ impl LrcMatcher {
 
         best
     }
+
+    /// Resolve the destination `.lrc` sidecar file path right next to the playing song's audio file.
+    /// 1. Uses `query.url` directly if it points to a local audio file on disk.
+    /// 2. Otherwise searches `self.root_dir` for the matching local audio file (`.flac`, `.mp3`, `.m4a`, etc.)
+    ///    whose match confidence meets `min_threshold`.
+    pub fn resolve_sidecar_lrc_target(
+        &self,
+        query: &TrackQuery,
+        min_threshold: f64,
+    ) -> Option<PathBuf> {
+        if let Some(audio_path) = resolve_local_audio_path(query) {
+            if audio_path.file_stem().is_some() {
+                return Some(audio_path.with_extension("lrc"));
+            }
+        }
+
+        if !self.root_dir.exists() || query.is_empty() {
+            return None;
+        }
+
+        let threshold = min_threshold.max(self.match_threshold);
+        let url_stem = query
+            .url
+            .as_deref()
+            .and_then(extract_url_file_stem)
+            .map(|s| normalize(&s));
+
+        let mut best_audio: Option<(PathBuf, f64)> = None;
+        const AUDIO_EXTENSIONS: &[&str] = &[
+            "flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "wv", "ape", "alac", "aiff", "dsf",
+        ];
+
+        for entry in WalkDir::new(&self.root_dir)
+            .follow_links(true)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let is_audio = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|ext| AUDIO_EXTENSIONS.iter().any(|&a| ext.eq_ignore_ascii_case(a)))
+                .unwrap_or(false);
+            if !is_audio {
+                continue;
+            }
+
+            let file_stem = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or_default()
+                .to_string();
+            let norm_stem = normalize(&file_stem);
+            let stripped_stem = normalize(&strip_leading_track_num(&strip_decorations(&file_stem)));
+            let parent_dir = path
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .map(normalize)
+                .unwrap_or_default();
+            let grandparent_dir = path
+                .parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .map(normalize)
+                .unwrap_or_default();
+
+            let candidate = IndexedLrc {
+                path: path.to_path_buf(),
+                file_stem,
+                norm_stem,
+                stripped_stem,
+                parent_dir,
+                grandparent_dir,
+                metadata: LrcMetadata::default(),
+            };
+            let score = score_candidate(&candidate, query, url_stem.as_deref());
+            if score >= threshold {
+                if best_audio.as_ref().map_or(true, |(_, prev_s)| score > *prev_s) {
+                    best_audio = Some((path.with_extension("lrc"), score));
+                }
+            }
+        }
+
+        best_audio.map(|(p, _)| p)
+    }
+
+    /// Save fetched remote lyrics as a `.lrc` sidecar file next to the matching local audio file
+    /// when its confidence score meets `save_lrc_threshold` (without overwriting an existing non-empty `.lrc` file).
+    pub fn save_fetched_sidecar(
+        &mut self,
+        query: &TrackQuery,
+        lrc: &ParsedLrc,
+        save_lrc_threshold: f64,
+    ) -> Option<PathBuf> {
+        if lrc.lines.is_empty() || lrc.match_score < save_lrc_threshold {
+            return None;
+        }
+        let target_path = self.resolve_sidecar_lrc_target(query, save_lrc_threshold)?;
+        if let Ok(meta) = std::fs::metadata(&target_path) {
+            if meta.is_file() && meta.len() > 0 {
+                return Some(target_path);
+            }
+        }
+
+        lrc.save_to_file(&target_path).ok()?;
+
+        // Immediately index the newly saved sidecar `.lrc` file
+        let file_stem = target_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let norm_stem = normalize(&file_stem);
+        let stripped_stem = normalize(&strip_leading_track_num(&strip_decorations(&file_stem)));
+        let parent_dir = target_path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(normalize)
+            .unwrap_or_default();
+        let grandparent_dir = target_path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.file_name())
+            .and_then(|s| s.to_str())
+            .map(normalize)
+            .unwrap_or_default();
+
+        self.entries.push(IndexedLrc {
+            path: target_path.clone(),
+            file_stem,
+            norm_stem,
+            stripped_stem,
+            parent_dir,
+            grandparent_dir,
+            metadata: lrc.metadata.clone(),
+        });
+
+        Some(target_path)
+    }
 }
 
 fn score_candidate(entry: &IndexedLrc, query: &TrackQuery, url_stem: Option<&str>) -> f64 {
@@ -959,6 +1114,40 @@ mod tests {
         assert_eq!(cleaned2.core_artist, "Artist");
         assert_eq!(cleaned2.album, None);
         assert_eq!(cleaned2.stripped_title_artist_query(), "Song Artist");
+
+        // Sidecar saving next to local audio file
+        let sidecar_dir =
+            std::env::temp_dir().join(format!("termlrc_sidecar_save_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&sidecar_dir);
+        fs::create_dir_all(&sidecar_dir).unwrap();
+        let audio_file = sidecar_dir.join("Daft Punk - Digital Love.flac");
+        fs::write(&audio_file, b"fake flac").unwrap();
+
+        let mut sidecar_matcher = LrcMatcher::new(sidecar_dir.clone(), 0.62);
+        let q_save = TrackQuery {
+            title: "Digital Love".to_string(),
+            artists: vec!["Daft Punk".to_string()],
+            album: None,
+            url: None,
+        };
+        let mut fetched = ParsedLrc::parse("[00:12.34]Last night I had a dream about you\n[00:16.50]In this dream I'm dancing right beside you\n");
+        fetched.match_score = 0.78;
+        assert!(
+            sidecar_matcher
+                .save_fetched_sidecar(&q_save, &fetched, 0.85)
+                .is_none(),
+            "Should not save sidecar when match_score (0.78) < save_lrc_threshold (0.85)"
+        );
+
+        fetched.match_score = 0.92;
+        let saved_path = sidecar_matcher
+            .save_fetched_sidecar(&q_save, &fetched, 0.85)
+            .expect("Should save sidecar .lrc next to matching audio file when >= threshold");
+        assert_eq!(saved_path, sidecar_dir.join("Daft Punk - Digital Love.lrc"));
+        assert!(saved_path.is_file());
+        let reloaded = ParsedLrc::from_file(&saved_path).unwrap();
+        assert_eq!(reloaded.lines.len(), 2);
+        let _ = fs::remove_dir_all(&sidecar_dir);
     }
 }
 

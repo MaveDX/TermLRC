@@ -292,7 +292,6 @@ pub struct ProviderCandidate {
     #[allow(dead_code)]
     pub duration_secs: Option<f64>,
     pub matches_playing_length: bool,
-    #[allow(dead_code)]
     pub score: f64,
 }
 
@@ -438,26 +437,32 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
             if let Some(ref synced) = cand.synced_lrc {
                 let mut out = synced.clone();
                 out.source_label = Some(format!("Lyrics from {}", cand.provider.display_name()));
+                out.match_score = cand.score;
                 return Some(out);
             }
         }
     }
 
     // 2. Collect all sources with valid synced lyrics and run line-by-line timing consensus
-    let synced_sources: Vec<(usize, FallbackProviderKind, &ParsedLrc)> = candidates
+    let synced_sources: Vec<(usize, FallbackProviderKind, &ParsedLrc, f64)> = candidates
         .iter()
         .filter_map(|c| {
             c.synced_lrc
                 .as_ref()
-                .map(|lrc| (c.provider_order, c.provider, lrc))
+                .map(|lrc| (c.provider_order, c.provider, lrc, c.score))
         })
         .collect();
 
     if !synced_sources.is_empty() {
-        let best_idx = select_best_synced_by_consensus(&synced_sources);
-        let (_, provider, winning_lrc) = synced_sources[best_idx];
+        let stripped: Vec<(usize, FallbackProviderKind, &ParsedLrc)> = synced_sources
+            .iter()
+            .map(|&(ord, prov, lrc, _)| (ord, prov, lrc))
+            .collect();
+        let best_idx = select_best_synced_by_consensus(&stripped);
+        let (_, provider, winning_lrc, score) = synced_sources[best_idx];
         let mut out = winning_lrc.clone();
         out.source_label = Some(format!("Lyrics from {}", provider.display_name()));
+        out.match_score = score;
         return Some(out);
     }
 
@@ -465,6 +470,7 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
     for cand in candidates {
         if let Some(mut plain) = cand.plain_lrc {
             plain.source_label = Some(format!("Lyrics from {}", cand.provider.display_name()));
+            plain.match_score = cand.score;
             return Some(plain);
         }
     }
@@ -1290,6 +1296,7 @@ fn parse_kpoe_lyrics_json(json: &Value) -> Option<ParsedLrc> {
         lines,
         source_label: None,
         is_synced: has_real_timestamps,
+        match_score: 1.0,
     })
 }
 

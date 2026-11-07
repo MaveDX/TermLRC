@@ -84,6 +84,8 @@ pub struct Settings {
     pub fallback_match_threshold: f64,
     pub prefer_uncensored: bool,
     pub enable_metadata_identify: bool,
+    pub save_lrc_file: bool,
+    pub save_lrc_threshold: f64,
     pub fallback_priority: Vec<String>,
     pub enable_lrcmux: bool,
     pub enable_lyricsplus: bool,
@@ -135,6 +137,8 @@ impl Default for Settings {
             fallback_match_threshold: 0.72,
             prefer_uncensored: true,
             enable_metadata_identify: true,
+            save_lrc_file: true,
+            save_lrc_threshold: 0.85,
             fallback_priority: vec![
                 String::from("lrcmux"),
                 String::from("lyricsplus"),
@@ -167,6 +171,7 @@ impl Settings {
         self.mpris_poll_ms = self.mpris_poll_ms.clamp(50, 2000);
         self.match_threshold = self.match_threshold.clamp(0.1, 0.99);
         self.fallback_match_threshold = self.fallback_match_threshold.clamp(0.1, 0.99);
+        self.save_lrc_threshold = self.save_lrc_threshold.clamp(0.1, 0.99);
         if let Some(ref p) = self.player {
             if p.trim().is_empty() {
                 self.player = None;
@@ -258,6 +263,9 @@ impl Settings {
         }
         if let Some(karaoke) = cli.karaoke {
             self.karaoke = karaoke;
+        }
+        if let Some(save_lrc) = cli.save_lrc_file {
+            self.save_lrc_file = save_lrc;
         }
         *self = self.clone().sanitized();
     }

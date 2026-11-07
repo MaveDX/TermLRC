@@ -9,6 +9,10 @@ fn default_true() -> bool {
     true
 }
 
+fn default_match_score() -> f64 {
+    1.0
+}
+
 /// Metadata extracted from LRC header tags (`[ti:]`, `[ar:]`, `[al:]`, `[offset:]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LrcMetadata {
@@ -45,6 +49,9 @@ pub struct ParsedLrc {
     /// Whether these lyrics have real line timestamps (`true`) or are unsynced plain text (`false`).
     #[serde(default = "default_true")]
     pub is_synced: bool,
+    /// Confidence score `[0.0, 1.0]` of the remote or local match.
+    #[serde(default = "default_match_score")]
+    pub match_score: f64,
 }
 
 impl Default for ParsedLrc {
@@ -54,6 +61,7 @@ impl Default for ParsedLrc {
             lines: Vec::new(),
             source_label: None,
             is_synced: true,
+            match_score: 1.0,
         }
     }
 }
@@ -142,6 +150,7 @@ impl ParsedLrc {
             lines,
             source_label: None,
             is_synced: true,
+            match_score: 1.0,
         }
     }
 
@@ -170,7 +179,77 @@ impl ParsedLrc {
             lines,
             source_label: None,
             is_synced: false,
+            match_score: 1.0,
         }
+    }
+
+    /// Format this `ParsedLrc` back into standard `.lrc` file text (preserving Enhanced LRC word tags if present).
+    pub fn to_lrc_string(&self) -> String {
+        let mut out = String::new();
+        if let Some(ref ti) = self.metadata.title {
+            if !ti.trim().is_empty() {
+                out.push_str(&format!("[ti:{}]\n", ti.trim()));
+            }
+        }
+        if let Some(ref ar) = self.metadata.artist {
+            if !ar.trim().is_empty() {
+                out.push_str(&format!("[ar:{}]\n", ar.trim()));
+            }
+        }
+        if let Some(ref al) = self.metadata.album {
+            if !al.trim().is_empty() {
+                out.push_str(&format!("[al:{}]\n", al.trim()));
+            }
+        }
+        if self.metadata.offset_ms != 0 {
+            out.push_str(&format!("[offset:{}]\n", self.metadata.offset_ms));
+        }
+
+        for line in &self.lines {
+            if self.is_synced {
+                out.push('[');
+                out.push_str(&format_lrc_timestamp(line.timestamp));
+                out.push(']');
+                if !line.segments.is_empty() {
+                    for (idx, seg) in line.segments.iter().enumerate() {
+                        out.push('<');
+                        out.push_str(&format_lrc_timestamp(seg.timestamp));
+                        out.push('>');
+                        out.push_str(&seg.text);
+                        if idx + 1 < line.segments.len()
+                            && !seg.text.ends_with(' ')
+                            && !line.segments[idx + 1].text.starts_with(' ')
+                        {
+                            out.push(' ');
+                        }
+                    }
+                } else {
+                    out.push_str(&line.text);
+                }
+                out.push('\n');
+            } else {
+                out.push_str(&line.text);
+                out.push('\n');
+            }
+        }
+        out
+    }
+
+    /// Atomically write this `ParsedLrc` to a `.lrc` sidecar file on disk.
+    pub fn save_to_file(&self, path: &Path) -> Result<()> {
+        if self.lines.is_empty() {
+            return Ok(());
+        }
+        let content = self.to_lrc_string();
+        let tmp_path = path.with_extension("lrc.tmp");
+        if fs::write(&tmp_path, content.as_bytes()).is_ok() {
+            if fs::rename(&tmp_path, path).is_ok() {
+                return Ok(());
+            }
+            let _ = fs::remove_file(&tmp_path);
+        }
+        fs::write(path, content.as_bytes())
+            .with_context(|| format!("Failed to write sidecar LRC file: {}", path.display()))
     }
 
     /// Compute the active line and smooth fractional progress for a given playback position.
@@ -322,6 +401,15 @@ fn extract_line_timestamps(mut input: &str) -> (Vec<Duration>, &str) {
         break;
     }
     (timestamps, input.trim())
+}
+
+/// Format a `Duration` as `mm:ss.xx` for standard LRC output.
+fn format_lrc_timestamp(d: Duration) -> String {
+    let total_cs = (d.as_millis() + 5) / 10;
+    let mins = total_cs / 6000;
+    let secs = (total_cs % 6000) / 100;
+    let cs = total_cs % 100;
+    format!("{:02}:{:02}.{:02}", mins, secs, cs)
 }
 
 /// Parse a timestamp string like `01:23.45`, `01:23.456`, `01:23:45`, or `01:23`.

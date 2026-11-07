@@ -58,6 +58,8 @@ match_threshold = 0.62
 fallback_match_threshold = 0.72
 prefer_uncensored = true
 enable_metadata_identify = true
+save_lrc_file = true
+save_lrc_threshold = 0.85
 fallback_priority = ["lrcmux", "lyricsplus", "lrclib", "kugou", "netease"]
 
 enable_lrcmux = true

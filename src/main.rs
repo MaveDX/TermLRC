@@ -186,6 +186,14 @@ impl App {
                 || res.query == self.current_query
             {
                 if let Some(lrc) = res.lrc {
+                    let s = self.settings_mgr.settings();
+                    if s.save_lrc_file {
+                        let _ = self.matcher.save_fetched_sidecar(
+                            &self.current_query,
+                            &lrc,
+                            s.save_lrc_threshold,
+                        );
+                    }
                     self.current_lrc = Some(lrc);
                     self.retry_attempt = 0;
                     self.next_retry_at = None;

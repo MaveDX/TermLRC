@@ -119,6 +119,12 @@ prefer_uncensored = true
 # Clean up video-style metadata and identify canonical recording via Deezer and MusicBrainz
 enable_metadata_identify = true
 
+# Automatically save fetched remote lyrics as a sibling .lrc sidecar file next to the local audio file
+save_lrc_file = true
+
+# Minimum confidence score (0.1 - 0.99) required to save fetched remote lyrics as a local .lrc file
+save_lrc_threshold = 0.85
+
 # Priority order of remote fallback providers when local .lrc search fails.
 # Valid providers: "lrcmux", "lyricsplus", "lrclib", "kugou", "netease"
 # Note: KuGou and NetEase are queried only when none of the earlier providers
