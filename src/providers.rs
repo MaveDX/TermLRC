@@ -28,10 +28,21 @@ enum ServiceEndpoint {
     MusicBrainz,
 }
 
+/// Live status of the lyrics lookup / download pipeline.
+#[derive(Debug, Clone, PartialEq)]
+pub enum LookupStatus {
+    Idle,
+    Searching,
+    Downloading { progress: f32 },
+    RateLimited,
+    NotFound,
+}
+
 #[derive(Debug, Clone, Default)]
 struct RateLimitState {
     last_request: Option<Instant>,
     cooldown_until: Option<Instant>,
+    is_rate_limit_429: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -80,9 +91,19 @@ impl ProviderCaches {
             .unwrap_or(false)
     }
 
-    fn set_cooldown(&mut self, endpoint: ServiceEndpoint, duration: Duration) {
+    fn is_rate_limited_429(&self, endpoint: ServiceEndpoint) -> bool {
+        self.rate_limits
+            .get(&endpoint)
+            .filter(|s| s.is_rate_limit_429)
+            .and_then(|s| s.cooldown_until)
+            .map(|until| Instant::now() < until)
+            .unwrap_or(false)
+    }
+
+    fn set_cooldown(&mut self, endpoint: ServiceEndpoint, duration: Duration, is_429: bool) {
         let state = self.rate_limits.entry(endpoint).or_default();
         state.cooldown_until = Some(Instant::now() + duration);
+        state.is_rate_limit_429 = is_429;
     }
 
     fn wait_turn(&mut self, endpoint: ServiceEndpoint) {
@@ -190,15 +211,15 @@ fn endpoint_http_get_string(
                     .and_then(|h| h.trim().parse::<u64>().ok())
                     .unwrap_or(default_wait)
                     .clamp(5, 600);
-                caches.set_cooldown(endpoint, Duration::from_secs(retry_secs));
+                caches.set_cooldown(endpoint, Duration::from_secs(retry_secs), code == 429);
             } else if code >= 500 || code == 403 || code == 401 {
-                caches.set_cooldown(endpoint, Duration::from_secs(30));
+                caches.set_cooldown(endpoint, Duration::from_secs(30), false);
             }
             None
         }
         Err(ureq::Error::Transport(_)) => {
             // Provider failed (DNS/connection/timeout); skip it for a while
-            caches.set_cooldown(endpoint, Duration::from_secs(30));
+            caches.set_cooldown(endpoint, Duration::from_secs(30), false);
             None
         }
     }
@@ -221,22 +242,29 @@ pub struct FallbackRequest {
     pub settings: Settings,
 }
 
-pub struct FallbackResponse {
-    pub query: TrackQuery,
-    pub lrc: Option<ParsedLrc>,
+pub enum FallbackEvent {
+    Status {
+        query: TrackQuery,
+        status: LookupStatus,
+    },
+    Completed {
+        query: TrackQuery,
+        lrc: Option<ParsedLrc>,
+        rate_limited: bool,
+    },
 }
 
 /// Asynchronous background worker that queries remote fallback providers in priority order
 /// without blocking the TUI rendering loop.
 pub struct FallbackWorker {
     tx: Sender<FallbackRequest>,
-    rx: Receiver<FallbackResponse>,
+    rx: Receiver<FallbackEvent>,
 }
 
 impl FallbackWorker {
     pub fn new() -> Self {
         let (req_tx, req_rx) = mpsc::channel::<FallbackRequest>();
-        let (res_tx, res_rx) = mpsc::channel::<FallbackResponse>();
+        let (res_tx, res_rx) = mpsc::channel::<FallbackEvent>();
 
         thread::spawn(move || {
             let mut caches = ProviderCaches::default();
@@ -246,15 +274,22 @@ impl FallbackWorker {
                     req = newer;
                 }
 
-                let lrc = fetch_from_fallback_chain(
+                let _ = res_tx.send(FallbackEvent::Status {
+                    query: req.query.clone(),
+                    status: LookupStatus::Searching,
+                });
+
+                let (lrc, rate_limited) = fetch_from_fallback_chain(
                     &req.query,
                     req.track_length,
                     &req.settings,
                     &mut caches,
+                    &res_tx,
                 );
-                let _ = res_tx.send(FallbackResponse {
+                let _ = res_tx.send(FallbackEvent::Completed {
                     query: req.query,
                     lrc,
+                    rate_limited,
                 });
             }
         });
@@ -273,12 +308,8 @@ impl FallbackWorker {
         });
     }
 
-    pub fn poll_response(&self) -> Option<FallbackResponse> {
-        let mut latest = None;
-        while let Ok(res) = self.rx.try_recv() {
-            latest = Some(res);
-        }
-        latest
+    pub fn poll_event(&self) -> Option<FallbackEvent> {
+        self.rx.try_recv().ok()
     }
 }
 
@@ -364,24 +395,26 @@ fn fetch_from_fallback_chain(
     track_length: Option<Duration>,
     settings: &Settings,
     caches: &mut ProviderCaches,
-) -> Option<ParsedLrc> {
+    event_tx: &Sender<FallbackEvent>,
+) -> (Option<ParsedLrc>, bool) {
     if raw_query.title.trim().is_empty() {
-        return None;
+        return (None, false);
     }
 
     let cache_key = build_query_cache_key(raw_query, settings);
     if let Some(cached) = caches.get_cached_lyrics(&cache_key) {
-        return Some(cached);
+        return (Some(cached), false);
     }
 
     let lookup = prepare_lookup_metadata(raw_query, track_length, settings, caches);
     let enabled = settings.enabled_fallback_providers();
     if enabled.is_empty() {
-        return None;
+        return (None, false);
     }
 
     let mut candidates: Vec<ProviderCandidate> = Vec::new();
     let mut have_length_matched_synced = false;
+    let mut any_rate_limited = false;
 
     for (order_idx, provider) in enabled.iter().copied().enumerate() {
         // KuGou and NetEase Cloud Music are queried ONLY when none of the earlier providers
@@ -389,7 +422,11 @@ fn fetch_from_fallback_chain(
         if provider.is_secondary_cjk_provider() && have_length_matched_synced {
             continue;
         }
-        if caches.is_on_cooldown(ServiceEndpoint::Provider(provider)) {
+        let ep = ServiceEndpoint::Provider(provider);
+        if caches.is_on_cooldown(ep) {
+            if caches.is_rate_limited_429(ep) {
+                any_rate_limited = true;
+            }
             continue;
         }
 
@@ -409,20 +446,43 @@ fn fetch_from_fallback_chain(
             }
         };
 
+        if caches.is_rate_limited_429(ep) {
+            any_rate_limited = true;
+        }
+
         if let Some(c) = cand {
             if c.has_synced() && c.matches_playing_length {
                 have_length_matched_synced = true;
             }
+            let step_prog = ((candidates.len() as f32 + 1.0) / 2.0).clamp(0.35, 0.85);
+            let _ = event_tx.send(FallbackEvent::Status {
+                query: raw_query.clone(),
+                status: LookupStatus::Downloading {
+                    progress: step_prog,
+                },
+            });
             candidates.push(c);
         }
     }
 
-    let chosen = select_best_candidate(candidates)?;
+    let Some(chosen) = select_best_candidate(candidates) else {
+        return (None, any_rate_limited);
+    };
     if chosen.lines.is_empty() {
-        return None;
+        return (None, any_rate_limited);
     }
+
+    // Emit final downloading progress steps so the user sees the download progress bar fill
+    for prog in [0.65f32, 0.90, 1.0] {
+        let _ = event_tx.send(FallbackEvent::Status {
+            query: raw_query.clone(),
+            status: LookupStatus::Downloading { progress: prog },
+        });
+        thread::sleep(Duration::from_millis(28));
+    }
+
     caches.insert_cached_lyrics(cache_key, chosen.clone());
-    Some(chosen)
+    (Some(chosen), false)
 }
 
 /// Select the winning `ParsedLrc` from the collected provider candidates:

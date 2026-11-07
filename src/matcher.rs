@@ -648,7 +648,40 @@ impl LrcMatcher {
             }
         }
 
-        best_audio.map(|(p, _)| p)
+        if let Some((p, _)) = best_audio {
+            return Some(p);
+        }
+
+        None
+    }
+
+    /// Fallback path inside `self.root_dir` (`<Artist> - <Title>.lrc`) when `local_only_lyrics` is enabled
+    /// and no matching local audio file was found on disk.
+    pub fn fallback_root_lrc_path(&self, query: &TrackQuery) -> Option<PathBuf> {
+        if !self.root_dir.is_dir() || query.title.trim().is_empty() {
+            return None;
+        }
+        let cleaned = clean_video_metadata(query);
+        let raw_name = if !cleaned.core_artist.is_empty() {
+            format!("{} - {}", cleaned.core_artist, cleaned.core_title)
+        } else {
+            cleaned.core_title
+        };
+        let safe_stem: String = raw_name
+            .chars()
+            .map(|c| {
+                if matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|') {
+                    '_'
+                } else {
+                    c
+                }
+            })
+            .collect();
+        let trimmed = safe_stem.trim();
+        if trimmed.is_empty() {
+            return None;
+        }
+        Some(self.root_dir.join(format!("{}.lrc", trimmed)))
     }
 
     /// Save fetched remote lyrics as a `.lrc` sidecar file next to the matching local audio file
@@ -658,11 +691,20 @@ impl LrcMatcher {
         query: &TrackQuery,
         lrc: &ParsedLrc,
         save_lrc_threshold: f64,
+        fallback_to_root_dir: bool,
     ) -> Option<PathBuf> {
         if lrc.lines.is_empty() || lrc.match_score < save_lrc_threshold {
             return None;
         }
-        let target_path = self.resolve_sidecar_lrc_target(query, save_lrc_threshold)?;
+        let target_path = self
+            .resolve_sidecar_lrc_target(query, save_lrc_threshold)
+            .or_else(|| {
+                if fallback_to_root_dir {
+                    self.fallback_root_lrc_path(query)
+                } else {
+                    None
+                }
+            })?;
         if let Ok(meta) = std::fs::metadata(&target_path) {
             if meta.is_file() && meta.len() > 0 {
                 return Some(target_path);
@@ -1134,14 +1176,14 @@ mod tests {
         fetched.match_score = 0.78;
         assert!(
             sidecar_matcher
-                .save_fetched_sidecar(&q_save, &fetched, 0.85)
+                .save_fetched_sidecar(&q_save, &fetched, 0.85, false)
                 .is_none(),
             "Should not save sidecar when match_score (0.78) < save_lrc_threshold (0.85)"
         );
 
         fetched.match_score = 0.92;
         let saved_path = sidecar_matcher
-            .save_fetched_sidecar(&q_save, &fetched, 0.85)
+            .save_fetched_sidecar(&q_save, &fetched, 0.85, false)
             .expect("Should save sidecar .lrc next to matching audio file when >= threshold");
         assert_eq!(saved_path, sidecar_dir.join("Daft Punk - Digital Love.lrc"));
         assert!(saved_path.is_file());

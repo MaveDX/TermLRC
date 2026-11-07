@@ -1,5 +1,6 @@
 use crate::config::Settings;
 use crate::lrc::{LyricSyncState, ParsedLrc};
+use crate::providers::LookupStatus;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Modifier, Style},
@@ -60,6 +61,8 @@ pub struct UiState {
     /// Manual scroll override offset (in lines) when user scrolls with Up/Down keys;
     /// resets automatically when the active lyric line advances.
     pub manual_line_offset: isize,
+    /// Current status of lyric search/download when no lyrics are loaded yet.
+    pub lookup_status: LookupStatus,
     last_active_index: Option<usize>,
 }
 
@@ -90,6 +93,7 @@ impl UiState {
             empty_line_symbol: s.empty_line_symbol.clone(),
             idle_symbol: s.idle_symbol.clone(),
             manual_line_offset: 0,
+            lookup_status: LookupStatus::Idle,
             last_active_index: None,
         }
     }
@@ -164,22 +168,75 @@ pub fn draw(frame: &mut Frame, lrc: Option<&ParsedLrc>, sync: &LyricSyncState, u
     }
 
     let Some(parsed) = lrc.filter(|l| !l.lines.is_empty()) else {
-        if !ui.idle_symbol.is_empty() {
-            let mid_y = area.y + area.height / 2;
-            let row = Rect {
-                x: area.x,
-                y: mid_y,
-                width: area.width,
-                height: 1,
-            };
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    ui.idle_symbol.as_str(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
-                .alignment(ui.alignment),
-                row,
-            );
+        let mid_y = area.y + area.height / 2;
+        match ui.lookup_status {
+            LookupStatus::Downloading { progress } => {
+                let pct = (progress.clamp(0.0, 1.0) * 100.0).round() as usize;
+                let bar_w = 20usize;
+                let filled = ((progress.clamp(0.0, 1.0) * bar_w as f32).round() as usize).min(bar_w);
+                let empty = bar_w.saturating_sub(filled);
+                let bar_str = format!(
+                    "[{}{}] {}%",
+                    "█".repeat(filled),
+                    "░".repeat(empty),
+                    pct
+                );
+                let row1 = Rect {
+                    x: area.x,
+                    y: mid_y.saturating_sub(1),
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        "Downloading",
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                    .alignment(ui.alignment),
+                    row1,
+                );
+                if mid_y < area.y + area.height {
+                    let row2 = Rect {
+                        x: area.x,
+                        y: mid_y,
+                        width: area.width,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            bar_str,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))
+                        .alignment(ui.alignment),
+                        row2,
+                    );
+                }
+            }
+            _ => {
+                let msg = match ui.lookup_status {
+                    LookupStatus::Idle => ui.idle_symbol.as_str(),
+                    LookupStatus::Searching => "Searching",
+                    LookupStatus::RateLimited => "Rate limited",
+                    LookupStatus::NotFound => "Lyrics not found",
+                    LookupStatus::Downloading { .. } => "Downloading",
+                };
+                if !msg.is_empty() {
+                    let row = Rect {
+                        x: area.x,
+                        y: mid_y,
+                        width: area.width,
+                        height: 1,
+                    };
+                    frame.render_widget(
+                        Paragraph::new(Span::styled(
+                            msg,
+                            Style::default().add_modifier(Modifier::DIM),
+                        ))
+                        .alignment(ui.alignment),
+                        row,
+                    );
+                }
+            }
         }
         return;
     };

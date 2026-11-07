@@ -60,6 +60,7 @@ prefer_uncensored = true
 enable_metadata_identify = true
 save_lrc_file = true
 save_lrc_threshold = 0.85
+local_only_lyrics = false
 fallback_priority = ["lrcmux", "lyricsplus", "lrclib", "kugou", "netease"]
 
 enable_lrcmux = true

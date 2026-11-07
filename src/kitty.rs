@@ -1,4 +1,5 @@
 use crate::lrc::{LyricSyncState, ParsedLrc};
+use crate::providers::LookupStatus;
 use crate::ui::UiState;
 use ab_glyph::{point, Font, FontArc, GlyphId, PxScale, ScaleFont};
 use anyhow::Result;
@@ -106,6 +107,8 @@ struct FrameStateKey {
     spacing_tenths: u32,
     active_buf_tenths: u32,
     inactive_buf_tenths: u32,
+    status_tag: u8,
+    download_pct: u8,
 }
 
 impl KittyRenderer {
@@ -178,6 +181,16 @@ impl KittyRenderer {
             return Ok(());
         }
 
+        let (status_tag, download_pct) = match ui.lookup_status {
+            LookupStatus::Idle => (0u8, 0u8),
+            LookupStatus::Searching => (1u8, 0u8),
+            LookupStatus::Downloading { progress } => {
+                (2u8, (progress.clamp(0.0, 1.0) * 100.0).round() as u8)
+            }
+            LookupStatus::RateLimited => (3u8, 0u8),
+            LookupStatus::NotFound => (4u8, 0u8),
+        };
+
         let scroll_px = ui.scroll_line * ui.pixel_line_spacing as f64;
         let state_key = FrameStateKey {
             width,
@@ -193,6 +206,8 @@ impl KittyRenderer {
             spacing_tenths: (ui.pixel_line_spacing * 10.0).round() as u32,
             active_buf_tenths: (ui.active_lyric_buffer_px * 10.0).round() as u32,
             inactive_buf_tenths: (ui.inactive_lyric_buffer_px * 10.0).round() as u32,
+            status_tag,
+            download_pct,
         };
 
         if self.last_state_key.as_ref() == Some(&state_key) {
@@ -461,25 +476,66 @@ fn draw_pixel_lyrics(
     let max_text_width = (w_f - margin_x * 2.0).max(120.0);
 
     let Some(parsed) = lrc.filter(|l| !l.lines.is_empty()) else {
-        if !ui.idle_symbol.is_empty() {
-            let scale = PxScale::from(ui.font_size_active);
-            let subline_h = fonts.primary().as_scaled(scale).height() * 1.18;
-            let wrapped = wrap_text_by_pixel_width(fonts, scale, &ui.idle_symbol, max_text_width);
-            draw_prewrapped_block(
-                fonts,
-                buf,
-                width,
-                height,
-                &wrapped,
-                center_y,
-                ui.font_size_active,
-                subline_h,
-                margin_x,
-                ui.alignment,
-                false,
-                0.0,
-                110,
-            );
+        let scale = PxScale::from(ui.font_size_inactive);
+        let subline_h = fonts.primary().as_scaled(scale).height() * 1.18;
+        match ui.lookup_status {
+            LookupStatus::Downloading { progress } => {
+                let pct = (progress.clamp(0.0, 1.0) * 100.0).round() as u8;
+                let label = format!("Downloading ({}%)", pct);
+                let wrapped = wrap_text_by_pixel_width(fonts, scale, &label, max_text_width);
+                draw_prewrapped_block(
+                    fonts,
+                    buf,
+                    width,
+                    height,
+                    &wrapped,
+                    center_y - subline_h * 0.75,
+                    ui.font_size_inactive,
+                    subline_h,
+                    margin_x,
+                    ui.alignment,
+                    false,
+                    0.0,
+                    160,
+                );
+                draw_pixel_progress_bar(
+                    buf,
+                    width,
+                    height,
+                    center_y + subline_h * 0.35,
+                    margin_x,
+                    max_text_width,
+                    ui.alignment,
+                    progress.clamp(0.0, 1.0),
+                );
+            }
+            _ => {
+                let msg = match ui.lookup_status {
+                    LookupStatus::Idle => ui.idle_symbol.as_str(),
+                    LookupStatus::Searching => "Searching",
+                    LookupStatus::RateLimited => "Rate limited",
+                    LookupStatus::NotFound => "Lyrics not found",
+                    LookupStatus::Downloading { .. } => "Downloading",
+                };
+                if !msg.is_empty() {
+                    let wrapped = wrap_text_by_pixel_width(fonts, scale, msg, max_text_width);
+                    draw_prewrapped_block(
+                        fonts,
+                        buf,
+                        width,
+                        height,
+                        &wrapped,
+                        center_y,
+                        ui.font_size_inactive,
+                        subline_h,
+                        margin_x,
+                        ui.alignment,
+                        false,
+                        0.0,
+                        140,
+                    );
+                }
+            }
         }
         return;
     };
@@ -611,6 +667,44 @@ fn draw_pixel_lyrics(
             sync.karaoke_progress as f32,
             base_alpha,
         );
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_pixel_progress_bar(
+    buf: &mut [u8],
+    width: u32,
+    height: u32,
+    center_y: f32,
+    margin_x: f32,
+    max_text_width: f32,
+    alignment: Alignment,
+    progress: f32,
+) {
+    let bar_w = (max_text_width * 0.42).clamp(140.0, 320.0);
+    let bar_h = 6.0f32;
+    let start_x = match alignment {
+        Alignment::Left => margin_x,
+        Alignment::Right => (width as f32 - margin_x - bar_w).max(margin_x),
+        Alignment::Center => ((width as f32 - bar_w) * 0.5).max(margin_x),
+    };
+    let x0 = (start_x.round() as i32).clamp(0, width as i32);
+    let x1 = ((start_x + bar_w).round() as i32).clamp(0, width as i32);
+    let fill_x1 = ((start_x + bar_w * progress.clamp(0.0, 1.0)).round() as i32).clamp(x0, x1);
+    let y0 = ((center_y - bar_h * 0.5).round() as i32).clamp(0, height as i32);
+    let y1 = ((center_y + bar_h * 0.5).round() as i32).clamp(0, height as i32);
+
+    for py in y0..y1 {
+        for px in x0..x1 {
+            let alpha = if px < fill_x1 { 220u8 } else { 55u8 };
+            let idx = ((py as u32 * width + px as u32) * 4) as usize;
+            if idx + 3 < buf.len() {
+                buf[idx] = 255;
+                buf[idx + 1] = 255;
+                buf[idx + 2] = 255;
+                buf[idx + 3] = buf[idx + 3].max(alpha);
+            }
+        }
     }
 }
 

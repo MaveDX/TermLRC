@@ -24,11 +24,15 @@ use kitty::KittyRenderer;
 use lrc::{LyricSyncState, ParsedLrc};
 use matcher::{find_sibling_lrc, LrcMatcher, TrackQuery};
 use player::MprisTracker;
-use providers::{is_valid_synced_lrc, retry_backoff_duration, FallbackWorker};
+use providers::{
+    is_valid_synced_lrc, retry_backoff_duration, FallbackEvent, FallbackWorker, LookupStatus,
+};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
+    fs,
     io::{self, Write},
-    time::{Duration, Instant},
+    path::PathBuf,
+    time::{Duration, Instant, SystemTime},
 };
 use ui::UiState;
 
@@ -43,6 +47,9 @@ struct App {
     current_query: TrackQuery,
     current_track_length: Option<Duration>,
     current_lrc: Option<ParsedLrc>,
+    current_lrc_path: Option<PathBuf>,
+    current_lrc_mtime: Option<SystemTime>,
+    last_local_hot_reload_check: Instant,
     retry_attempt: u32,
     next_retry_at: Option<Instant>,
 }
@@ -69,6 +76,9 @@ impl App {
             current_query: TrackQuery::default(),
             current_track_length: None,
             current_lrc: None,
+            current_lrc_path: None,
+            current_lrc_mtime: None,
+            last_local_hot_reload_check: Instant::now(),
             retry_attempt: 0,
             next_retry_at: None,
         }
@@ -76,6 +86,40 @@ impl App {
 
     fn fps(&self) -> u32 {
         self.settings_mgr.settings().fps.clamp(15, 240)
+    }
+
+    fn set_local_lrc(&mut self, path: PathBuf, parsed: ParsedLrc) {
+        self.current_lrc_mtime = fs::metadata(&path).and_then(|m| m.modified()).ok();
+        self.current_lrc_path = Some(path);
+        self.current_lrc = Some(parsed);
+        self.ui.lookup_status = LookupStatus::Idle;
+        self.retry_attempt = 0;
+        self.next_retry_at = None;
+        self.kitty.invalidate();
+    }
+
+    fn try_load_local_lrc(&mut self) -> bool {
+        // 1. Direct sibling `.lrc` file next to the local audio file
+        if let Some(sibling_path) = find_sibling_lrc(&self.current_query) {
+            if let Ok(parsed) = ParsedLrc::from_file(&sibling_path) {
+                if !parsed.lines.is_empty() {
+                    self.set_local_lrc(sibling_path, parsed);
+                    return true;
+                }
+            }
+        }
+
+        // 2. Recursive `lyrics_dir` search
+        if let Some(m) = self.matcher.find_best_match(&self.current_query) {
+            if let Ok(parsed) = ParsedLrc::from_file(&m.path) {
+                if is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty() {
+                    self.set_local_lrc(m.path, parsed);
+                    return true;
+                }
+            }
+        }
+
+        false
     }
 
     fn force_rescan_and_match(&mut self) {
@@ -89,47 +133,69 @@ impl App {
         self.kitty.invalidate();
         if self.current_query.is_empty() {
             self.current_lrc = None;
+            self.current_lrc_path = None;
+            self.current_lrc_mtime = None;
+            self.ui.lookup_status = LookupStatus::Idle;
             self.retry_attempt = 0;
             self.next_retry_at = None;
             return;
         }
 
-        // 1. When a local audio file has a sibling `.lrc` file with the same name
-        //    (e.g. `song.flac` and `song.lrc`), use those lyrics without any network request.
-        if let Some(sibling_path) = find_sibling_lrc(&self.current_query) {
-            if let Ok(parsed) = ParsedLrc::from_file(&sibling_path) {
-                if !parsed.lines.is_empty() {
-                    self.current_lrc = Some(parsed);
-                    self.retry_attempt = 0;
-                    self.next_retry_at = None;
-                    return;
-                }
-            }
+        self.ui.lookup_status = LookupStatus::Searching;
+
+        if self.try_load_local_lrc() {
+            return;
         }
 
-        // 2. Try local recursive LRC folder
-        if let Some(m) = self.matcher.find_best_match(&self.current_query) {
-            if let Ok(parsed) = ParsedLrc::from_file(&m.path) {
-                if is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty() {
-                    self.current_lrc = Some(parsed);
-                    self.retry_attempt = 0;
-                    self.next_retry_at = None;
-                    return;
-                }
-            }
-        }
-
-        // 3. Dispatch remote fallback chain in priority order
+        // Local match not found: dispatch remote fallback chain in priority order
         if !preserve_existing_on_pending {
             self.current_lrc = None;
+            self.current_lrc_path = None;
+            self.current_lrc_mtime = None;
         }
         let settings = self.settings_mgr.settings().clone();
         if !settings.enabled_fallback_providers().is_empty() {
+            self.ui.lookup_status = LookupStatus::Searching;
             self.fallback_worker.request(
                 self.current_query.clone(),
                 self.current_track_length,
                 settings,
             );
+        } else {
+            self.ui.lookup_status = LookupStatus::NotFound;
+        }
+    }
+
+    /// Periodically check if a local `.lrc` file was newly downloaded or modified on disk
+    /// so lyrics hot-reload immediately without needing to switch songs.
+    fn poll_local_lrc_hot_reload(&mut self) {
+        if self.last_local_hot_reload_check.elapsed() < Duration::from_millis(750) {
+            return;
+        }
+        self.last_local_hot_reload_check = Instant::now();
+
+        if self.current_query.is_empty() {
+            return;
+        }
+
+        // Case 1: Already displaying a local `.lrc` file — check if it was modified on disk
+        if let Some(ref path) = self.current_lrc_path.clone() {
+            if let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) {
+                if self.current_lrc_mtime != Some(mtime) {
+                    if let Ok(parsed) = ParsedLrc::from_file(path) {
+                        if !parsed.lines.is_empty() {
+                            self.set_local_lrc(path.clone(), parsed);
+                        }
+                    }
+                }
+            }
+            return;
+        }
+
+        // Case 2: No local `.lrc` was loaded yet (either waiting/not found or showing remote lyrics)
+        // Check if a sibling `.lrc` or new `.lrc` in `lyrics_dir` has appeared on disk
+        if self.try_load_local_lrc() {
+            self.kitty.invalidate();
         }
     }
 
@@ -178,34 +244,79 @@ impl App {
             self.current_track_length = snap.length;
         }
 
-        // Check if background fallback worker completed a lookup for the active track
-        if let Some(res) = self.fallback_worker.poll_response() {
-            if res
-                .query
-                .is_same_track(&self.current_query, None, None)
-                || res.query == self.current_query
-            {
-                if let Some(lrc) = res.lrc {
-                    let s = self.settings_mgr.settings();
-                    if s.save_lrc_file {
-                        let _ = self.matcher.save_fetched_sidecar(
-                            &self.current_query,
-                            &lrc,
-                            s.save_lrc_threshold,
-                        );
+        // Drain status and completion events from the background fallback worker
+        while let Some(ev) = self.fallback_worker.poll_event() {
+            match ev {
+                FallbackEvent::Status { query, status } => {
+                    if query.is_same_track(&self.current_query, None, None)
+                        || query == self.current_query
+                    {
+                        if self.current_lrc.is_none() {
+                            self.ui.lookup_status = status;
+                            self.kitty.invalidate();
+                        }
                     }
-                    self.current_lrc = Some(lrc);
-                    self.retry_attempt = 0;
-                    self.next_retry_at = None;
-                    self.kitty.invalidate();
-                } else if self.current_lrc.is_none() {
-                    // Schedule exponential backoff retry: 30s -> 60s -> 120s -> ... -> 10m
-                    let delay = retry_backoff_duration(self.retry_attempt);
-                    self.retry_attempt = self.retry_attempt.saturating_add(1);
-                    self.next_retry_at = Some(Instant::now() + delay);
+                }
+                FallbackEvent::Completed {
+                    query,
+                    lrc,
+                    rate_limited,
+                } => {
+                    if query.is_same_track(&self.current_query, None, None)
+                        || query == self.current_query
+                    {
+                        if let Some(fetched_lrc) = lrc {
+                            let s = self.settings_mgr.settings().clone();
+                            let should_save = s.save_lrc_file || s.local_only_lyrics;
+                            let saved_path = if should_save {
+                                self.matcher.save_fetched_sidecar(
+                                    &self.current_query,
+                                    &fetched_lrc,
+                                    s.save_lrc_threshold,
+                                    s.local_only_lyrics,
+                                )
+                            } else {
+                                None
+                            };
+
+                            if let Some(path) = saved_path {
+                                // Instantly hot-reload the newly downloaded `.lrc` file from disk
+                                let reloaded =
+                                    ParsedLrc::from_file(&path).unwrap_or(fetched_lrc);
+                                self.set_local_lrc(path, reloaded);
+                            } else if s.local_only_lyrics {
+                                // `local_only_lyrics` is enabled, and the remote result could not be saved locally
+                                if self.current_lrc.is_none() {
+                                    self.ui.lookup_status = LookupStatus::NotFound;
+                                    self.kitty.invalidate();
+                                }
+                            } else {
+                                self.current_lrc_path = None;
+                                self.current_lrc_mtime = None;
+                                self.current_lrc = Some(fetched_lrc);
+                                self.ui.lookup_status = LookupStatus::Idle;
+                                self.retry_attempt = 0;
+                                self.next_retry_at = None;
+                                self.kitty.invalidate();
+                            }
+                        } else if self.current_lrc.is_none() {
+                            self.ui.lookup_status = if rate_limited {
+                                LookupStatus::RateLimited
+                            } else {
+                                LookupStatus::NotFound
+                            };
+                            let delay = retry_backoff_duration(self.retry_attempt);
+                            self.retry_attempt = self.retry_attempt.saturating_add(1);
+                            self.next_retry_at = Some(Instant::now() + delay);
+                            self.kitty.invalidate();
+                        }
+                    }
                 }
             }
         }
+
+        // Check for newly downloaded or modified local `.lrc` files on disk
+        self.poll_local_lrc_hot_reload();
 
         // Trigger scheduled retry if lookup previously failed and backoff timer elapsed
         if self.current_lrc.is_none() && !self.current_query.is_empty() {
@@ -214,6 +325,8 @@ impl App {
                     self.next_retry_at = None;
                     let settings = self.settings_mgr.settings().clone();
                     if !settings.enabled_fallback_providers().is_empty() {
+                        self.ui.lookup_status = LookupStatus::Searching;
+                        self.kitty.invalidate();
                         self.fallback_worker.request(
                             self.current_query.clone(),
                             self.current_track_length,

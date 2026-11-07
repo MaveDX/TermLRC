@@ -57,4 +57,8 @@ pub struct Cli {
     /// Save fetched remote lyrics as a `.lrc` sidecar file next to the matching local song file (overrides config.toml).
     #[arg(long = "save-lrc-file", alias = "save-sidecar")]
     pub save_lrc_file: Option<bool>,
+
+    /// Only display lyrics that exist as or have been downloaded to a local `.lrc` file (overrides config.toml).
+    #[arg(long = "local-only", alias = "local-only-lyrics")]
+    pub local_only_lyrics: Option<bool>,
 }

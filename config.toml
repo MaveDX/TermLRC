@@ -125,6 +125,10 @@ save_lrc_file = true
 # Minimum confidence score (0.1 - 0.99) required to save fetched remote lyrics as a local .lrc file
 save_lrc_threshold = 0.85
 
+# When true, remote providers are used ONLY to find and download .lrc files locally,
+# and only locally downloaded .lrc files are displayed.
+local_only_lyrics = false
+
 # Priority order of remote fallback providers when local .lrc search fails.
 # Valid providers: "lrcmux", "lyricsplus", "lrclib", "kugou", "netease"
 # Note: KuGou and NetEase are queried only when none of the earlier providers

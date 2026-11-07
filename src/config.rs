@@ -86,6 +86,8 @@ pub struct Settings {
     pub enable_metadata_identify: bool,
     pub save_lrc_file: bool,
     pub save_lrc_threshold: f64,
+    #[serde(alias = "only_show_local_lyrics", alias = "display_local_only")]
+    pub local_only_lyrics: bool,
     pub fallback_priority: Vec<String>,
     pub enable_lrcmux: bool,
     pub enable_lyricsplus: bool,
@@ -139,6 +141,7 @@ impl Default for Settings {
             enable_metadata_identify: true,
             save_lrc_file: true,
             save_lrc_threshold: 0.85,
+            local_only_lyrics: false,
             fallback_priority: vec![
                 String::from("lrcmux"),
                 String::from("lyricsplus"),
@@ -266,6 +269,9 @@ impl Settings {
         }
         if let Some(save_lrc) = cli.save_lrc_file {
             self.save_lrc_file = save_lrc;
+        }
+        if let Some(local_only) = cli.local_only_lyrics {
+            self.local_only_lyrics = local_only;
         }
         *self = self.clone().sanitized();
     }
