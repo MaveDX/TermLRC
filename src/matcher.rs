@@ -410,32 +410,166 @@ pub struct MatchResult {
     pub score: f64,
 }
 
+/// Check if `path` is inside any of the configured `blacklist_dirs`.
+pub fn is_path_blacklisted(path: &Path, blacklist_dirs: &[PathBuf]) -> bool {
+    if blacklist_dirs.is_empty() {
+        return false;
+    }
+    let canon_path = path.canonicalize().ok();
+    let path_str_low = path.to_string_lossy().to_lowercase();
+
+    for b_dir in blacklist_dirs {
+        let b_str = b_dir.to_string_lossy();
+        let b_trimmed = b_str.trim().trim_end_matches(['/', '\\']);
+        if b_trimmed.is_empty() {
+            continue;
+        }
+        if path.starts_with(b_dir) || path.starts_with(b_trimmed) {
+            return true;
+        }
+        if let (Some(ref cp), Ok(cb)) = (&canon_path, b_dir.canonicalize()) {
+            if cp.starts_with(&cb) {
+                return true;
+            }
+        }
+        let b_low = b_trimmed.to_lowercase();
+        if b_low.starts_with('/') || b_low.contains('/') {
+            if path_str_low == b_low || path_str_low.starts_with(&format!("{}/", b_low)) {
+                return true;
+            }
+        } else {
+            // Relative directory name match against any path component
+            if path.components().any(|comp| {
+                comp.as_os_str()
+                    .to_str()
+                    .map(|s| s.eq_ignore_ascii_case(b_trimmed))
+                    .unwrap_or(false)
+            }) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Recursive LRC directory scanner and fuzzy/exact matcher.
 #[derive(Debug, Default)]
 pub struct LrcMatcher {
     root_dir: PathBuf,
     match_threshold: f64,
+    blacklist_dirs: Vec<PathBuf>,
     entries: Vec<IndexedLrc>,
 }
 
 impl LrcMatcher {
     /// Create a new matcher pointed at `root_dir` and perform an initial recursive scan.
+    #[cfg(test)]
     pub fn new(root_dir: PathBuf, match_threshold: f64) -> Self {
+        Self::with_blacklist(root_dir, match_threshold, Vec::new())
+    }
+
+    /// Create a new matcher with an explicit list of blacklisted directories.
+    pub fn with_blacklist(
+        root_dir: PathBuf,
+        match_threshold: f64,
+        blacklist_dirs: Vec<PathBuf>,
+    ) -> Self {
         let mut matcher = Self {
             root_dir,
             match_threshold: match_threshold.clamp(0.1, 0.99),
+            blacklist_dirs,
             entries: Vec::new(),
         };
         matcher.rescan();
         matcher
     }
 
-    pub fn update_config(&mut self, root_dir: PathBuf, match_threshold: f64) -> bool {
+    pub fn update_config(
+        &mut self,
+        root_dir: PathBuf,
+        match_threshold: f64,
+        blacklist_dirs: Vec<PathBuf>,
+    ) -> bool {
         self.match_threshold = match_threshold.clamp(0.1, 0.99);
-        if self.root_dir != root_dir {
+        if self.root_dir != root_dir || self.blacklist_dirs != blacklist_dirs {
             self.root_dir = root_dir;
+            self.blacklist_dirs = blacklist_dirs;
             self.rescan();
             return true;
+        }
+        false
+    }
+
+    /// Check whether the currently playing track originates from a blacklisted directory.
+    pub fn is_track_blacklisted(&self, query: &TrackQuery) -> bool {
+        if self.blacklist_dirs.is_empty() || query.is_empty() {
+            return false;
+        }
+        if let Some(audio_path) = resolve_local_audio_path(query) {
+            if is_path_blacklisted(&audio_path, &self.blacklist_dirs) {
+                return true;
+            }
+        }
+        if let Some(ref raw_url) = query.url {
+            let decoded = urlencoding::decode(raw_url)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| raw_url.clone());
+            let clean = decoded.strip_prefix("file://").unwrap_or(&decoded);
+            if is_path_blacklisted(Path::new(clean), &self.blacklist_dirs) {
+                return true;
+            }
+        }
+        // If MPRIS did not provide a file:// URL, check if the track matches an audio file inside any blacklisted directory
+        for b_dir in &self.blacklist_dirs {
+            let resolved_b = if b_dir.is_relative() && self.root_dir.join(b_dir).is_dir() {
+                self.root_dir.join(b_dir)
+            } else {
+                b_dir.clone()
+            };
+            if !resolved_b.is_dir() {
+                continue;
+            }
+            for entry in WalkDir::new(&resolved_b)
+                .follow_links(true)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                let path = entry.path();
+                if !path.is_file() {
+                    continue;
+                }
+                let file_stem = path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if file_stem.is_empty() {
+                    continue;
+                }
+                let candidate = IndexedLrc {
+                    path: path.to_path_buf(),
+                    norm_stem: normalize(&file_stem),
+                    stripped_stem: normalize(&strip_leading_track_num(&strip_decorations(&file_stem))),
+                    file_stem,
+                    parent_dir: path
+                        .parent()
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                        .map(normalize)
+                        .unwrap_or_default(),
+                    grandparent_dir: path
+                        .parent()
+                        .and_then(|p| p.parent())
+                        .and_then(|p| p.file_name())
+                        .and_then(|s| s.to_str())
+                        .map(normalize)
+                        .unwrap_or_default(),
+                    metadata: LrcMetadata::default(),
+                };
+                if score_candidate(&candidate, query, None) >= self.match_threshold {
+                    return true;
+                }
+            }
         }
         false
     }
@@ -458,7 +592,7 @@ impl LrcMatcher {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_path_blacklisted(path, &self.blacklist_dirs) {
                 continue;
             }
             let is_lrc = path
@@ -571,6 +705,9 @@ impl LrcMatcher {
         min_threshold: f64,
     ) -> Option<PathBuf> {
         if let Some(audio_path) = resolve_local_audio_path(query) {
+            if is_path_blacklisted(&audio_path, &self.blacklist_dirs) {
+                return None;
+            }
             if audio_path.file_stem().is_some() {
                 return Some(audio_path.with_extension("lrc"));
             }
@@ -598,7 +735,7 @@ impl LrcMatcher {
             .filter_map(|e| e.ok())
         {
             let path = entry.path();
-            if !path.is_file() {
+            if !path.is_file() || is_path_blacklisted(path, &self.blacklist_dirs) {
                 continue;
             }
             let is_audio = path
@@ -685,13 +822,15 @@ impl LrcMatcher {
     }
 
     /// Save fetched remote lyrics as a `.lrc` sidecar file next to the matching local audio file
-    /// when its confidence score meets `save_lrc_threshold` (without overwriting an existing non-empty `.lrc` file).
+    /// when its confidence score meets `save_lrc_threshold`.
+    /// Will not overwrite an existing non-empty `.lrc` file unless `verify_lyrics` is true and the existing file fails verification.
     pub fn save_fetched_sidecar(
         &mut self,
         query: &TrackQuery,
         lrc: &ParsedLrc,
         save_lrc_threshold: f64,
         fallback_to_root_dir: bool,
+        verify_lyrics: bool,
     ) -> Option<PathBuf> {
         if lrc.lines.is_empty() || lrc.match_score < save_lrc_threshold {
             return None;
@@ -707,7 +846,16 @@ impl LrcMatcher {
             })?;
         if let Ok(meta) = std::fs::metadata(&target_path) {
             if meta.is_file() && meta.len() > 0 {
-                return Some(target_path);
+                let existing_is_valid = if verify_lyrics {
+                    ParsedLrc::from_file(&target_path)
+                        .map(|mut p| p.verify_and_clean())
+                        .unwrap_or(false)
+                } else {
+                    true
+                };
+                if existing_is_valid {
+                    return Some(target_path);
+                }
             }
         }
 
@@ -1176,19 +1324,44 @@ mod tests {
         fetched.match_score = 0.78;
         assert!(
             sidecar_matcher
-                .save_fetched_sidecar(&q_save, &fetched, 0.85, false)
+                .save_fetched_sidecar(&q_save, &fetched, 0.85, false, true)
                 .is_none(),
             "Should not save sidecar when match_score (0.78) < save_lrc_threshold (0.85)"
         );
 
         fetched.match_score = 0.92;
+        fetched.metadata.source = Some("lrcmux".to_string());
         let saved_path = sidecar_matcher
-            .save_fetched_sidecar(&q_save, &fetched, 0.85, false)
+            .save_fetched_sidecar(&q_save, &fetched, 0.85, false, true)
             .expect("Should save sidecar .lrc next to matching audio file when >= threshold");
         assert_eq!(saved_path, sidecar_dir.join("Daft Punk - Digital Love.lrc"));
         assert!(saved_path.is_file());
         let reloaded = ParsedLrc::from_file(&saved_path).unwrap();
         assert_eq!(reloaded.lines.len(), 2);
+        assert_eq!(
+            reloaded.source_label.as_deref(),
+            Some("Lyrics from lrcmux")
+        );
+
+        // Directory blacklist verification
+        let blacklisted_sub = sidecar_dir.join("Podcasts");
+        fs::create_dir_all(&blacklisted_sub).unwrap();
+        let bl_audio = blacklisted_sub.join("Episode 1.mp3");
+        fs::write(&bl_audio, b"fake mp3").unwrap();
+        let bl_matcher = LrcMatcher::with_blacklist(
+            sidecar_dir.clone(),
+            0.62,
+            vec![blacklisted_sub.clone()],
+        );
+        let q_bl = TrackQuery {
+            title: "Episode 1".to_string(),
+            artists: vec!["Host".to_string()],
+            album: None,
+            url: Some(format!("file://{}", bl_audio.display())),
+        };
+        assert!(bl_matcher.is_track_blacklisted(&q_bl));
+        assert!(!bl_matcher.is_track_blacklisted(&q_save));
+
         let _ = fs::remove_dir_all(&sidecar_dir);
     }
 }

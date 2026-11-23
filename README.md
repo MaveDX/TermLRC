@@ -52,6 +52,13 @@ pixel_line_spacing = 25.0
 active_lyric_buffer_px = 18.0
 inactive_lyric_buffer_px = 10.0
 alignment = "left"
+show_lyrics_source = true
+
+# Directory Blacklist & Lyrics Verification
+blacklist_dirs = []
+lyrics_disabled_text = "Lyrics Disabled"
+verify_lyrics = true
+rescan_failed_lyrics = true
 
 # Matching & Remote Fallbacks
 match_threshold = 0.62

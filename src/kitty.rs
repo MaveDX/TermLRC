@@ -109,6 +109,7 @@ struct FrameStateKey {
     inactive_buf_tenths: u32,
     status_tag: u8,
     download_pct: u8,
+    show_source: bool,
 }
 
 impl KittyRenderer {
@@ -189,6 +190,7 @@ impl KittyRenderer {
             }
             LookupStatus::RateLimited => (3u8, 0u8),
             LookupStatus::NotFound => (4u8, 0u8),
+            LookupStatus::Disabled => (5u8, 0u8),
         };
 
         let scroll_px = ui.scroll_line * ui.pixel_line_spacing as f64;
@@ -208,6 +210,7 @@ impl KittyRenderer {
             inactive_buf_tenths: (ui.inactive_lyric_buffer_px * 10.0).round() as u32,
             status_tag,
             download_pct,
+            show_source: ui.show_lyrics_source,
         };
 
         if self.last_state_key.as_ref() == Some(&state_key) {
@@ -515,6 +518,7 @@ fn draw_pixel_lyrics(
                     LookupStatus::Searching => "Searching",
                     LookupStatus::RateLimited => "Rate limited",
                     LookupStatus::NotFound => "Lyrics not found",
+                    LookupStatus::Disabled => ui.lyrics_disabled_text.as_str(),
                     LookupStatus::Downloading { .. } => "Downloading",
                 };
                 if !msg.is_empty() {
@@ -574,39 +578,41 @@ fn draw_pixel_lyrics(
         }
     }
 
-    // If lyrics came from a remote fallback provider, render "Lyrics from <Provider>"
+    // If `show_lyrics_source` is enabled, render the lyric source label (e.g. "Lyrics from lrcmux" or "Lyrics from Local LRC")
     // anchored above line 0 so it naturally scrolls away with the lyrics.
-    if let Some(ref source_label) = parsed.source_label {
-        let scale = PxScale::from(ui.font_size_inactive);
-        let subline_h = fonts.primary().as_scaled(scale).height() * 1.18;
-        let extra_intro_offset = if !ui.empty_line_symbol.is_empty() {
-            top_gap + subline_h * 0.8
-        } else {
-            0.0
-        };
-        let label_y = first_top - top_gap - extra_intro_offset;
-        if label_y > -step_px && label_y < h_f + step_px {
-            let edge_norm = ((label_y - center_y).abs() / half_h).clamp(0.0, 1.0);
-            let edge_fade = (1.0 - edge_norm.powi(2)).clamp(0.0, 1.0);
-            let label_alpha = (130.0 * edge_fade).round() as u8;
-            if label_alpha >= 4 {
-                let wrapped =
-                    wrap_text_by_pixel_width(fonts, scale, source_label, max_text_width);
-                draw_prewrapped_block(
-                    fonts,
-                    buf,
-                    width,
-                    height,
-                    &wrapped,
-                    label_y,
-                    ui.font_size_inactive,
-                    subline_h,
-                    margin_x,
-                    ui.alignment,
-                    false,
-                    0.0,
-                    label_alpha,
-                );
+    if ui.show_lyrics_source {
+        if let Some(ref source_label) = parsed.source_label {
+            let scale = PxScale::from(ui.font_size_inactive);
+            let subline_h = fonts.primary().as_scaled(scale).height() * 1.18;
+            let extra_intro_offset = if sync.active_index.is_none() && !ui.empty_line_symbol.is_empty() {
+                top_gap + subline_h * 0.8
+            } else {
+                0.0
+            };
+            let label_y = first_top - top_gap - extra_intro_offset;
+            if label_y > -step_px && label_y < h_f + step_px {
+                let edge_norm = ((label_y - center_y).abs() / half_h).clamp(0.0, 1.0);
+                let edge_fade = (1.0 - edge_norm.powi(2)).clamp(0.0, 1.0);
+                let label_alpha = (130.0 * edge_fade).round() as u8;
+                if label_alpha >= 4 {
+                    let wrapped =
+                        wrap_text_by_pixel_width(fonts, scale, source_label, max_text_width);
+                    draw_prewrapped_block(
+                        fonts,
+                        buf,
+                        width,
+                        height,
+                        &wrapped,
+                        label_y,
+                        ui.font_size_inactive,
+                        subline_h,
+                        margin_x,
+                        ui.alignment,
+                        false,
+                        0.0,
+                        label_alpha,
+                    );
+                }
             }
         }
     }

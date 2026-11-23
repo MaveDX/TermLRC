@@ -54,12 +54,20 @@ struct App {
     next_retry_at: Option<Instant>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalLoadOutcome {
+    Loaded,
+    FailedVerification,
+    NotFound,
+}
+
 impl App {
     fn new(cli: Cli) -> Self {
         let settings_mgr = SettingsManager::new(cli.clone());
         let s = settings_mgr.settings();
         let lyrics_dir = s.resolved_lyrics_dir(&cli);
-        let matcher = LrcMatcher::new(lyrics_dir, s.match_threshold);
+        let blacklist_dirs = s.resolved_blacklist_dirs();
+        let matcher = LrcMatcher::with_blacklist(lyrics_dir, s.match_threshold, blacklist_dirs);
         let tracker = MprisTracker::new(s.player.clone(), s.mpris_poll_ms);
         let fallback_worker = FallbackWorker::new();
         let ui = UiState::from_settings(s);
@@ -98,38 +106,67 @@ impl App {
         self.kitty.invalidate();
     }
 
-    fn try_load_local_lrc(&mut self) -> bool {
+    fn try_load_local_lrc(&mut self) -> LocalLoadOutcome {
+        let verify_lyrics = self.settings_mgr.settings().verify_lyrics;
+        let rescan_failed = self.settings_mgr.settings().rescan_failed_lyrics;
+        let mut saw_failed_verification = false;
+
         // 1. Direct sibling `.lrc` file next to the local audio file
         if let Some(sibling_path) = find_sibling_lrc(&self.current_query) {
-            if let Ok(parsed) = ParsedLrc::from_file(&sibling_path) {
-                if !parsed.lines.is_empty() {
+            if let Ok(mut parsed) = ParsedLrc::from_file(&sibling_path) {
+                let is_valid = if verify_lyrics {
+                    parsed.verify_and_clean()
+                } else {
+                    !parsed.lines.is_empty()
+                };
+                if is_valid {
                     self.set_local_lrc(sibling_path, parsed);
-                    return true;
+                    return LocalLoadOutcome::Loaded;
+                } else if verify_lyrics {
+                    saw_failed_verification = true;
+                    if rescan_failed {
+                        let _ = fs::remove_file(&sibling_path);
+                    }
                 }
             }
         }
 
         // 2. Recursive `lyrics_dir` search
         if let Some(m) = self.matcher.find_best_match(&self.current_query) {
-            if let Ok(parsed) = ParsedLrc::from_file(&m.path) {
-                if is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty() {
+            if let Ok(mut parsed) = ParsedLrc::from_file(&m.path) {
+                let is_valid = if verify_lyrics {
+                    parsed.verify_and_clean()
+                } else {
+                    is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty()
+                };
+                if is_valid {
                     self.set_local_lrc(m.path, parsed);
-                    return true;
+                    return LocalLoadOutcome::Loaded;
+                } else if verify_lyrics {
+                    saw_failed_verification = true;
+                    if rescan_failed {
+                        let _ = fs::remove_file(&m.path);
+                        self.matcher.rescan();
+                    }
                 }
             }
         }
 
-        false
+        if saw_failed_verification {
+            LocalLoadOutcome::FailedVerification
+        } else {
+            LocalLoadOutcome::NotFound
+        }
     }
 
     fn force_rescan_and_match(&mut self) {
         self.matcher.rescan();
         self.retry_attempt = 0;
         self.next_retry_at = None;
-        self.match_current_track(true);
+        self.match_current_track(true, true);
     }
 
-    fn match_current_track(&mut self, preserve_existing_on_pending: bool) {
+    fn match_current_track(&mut self, preserve_existing_on_pending: bool, force_bypass_cache: bool) {
         self.kitty.invalidate();
         if self.current_query.is_empty() {
             self.current_lrc = None;
@@ -141,25 +178,49 @@ impl App {
             return;
         }
 
-        self.ui.lookup_status = LookupStatus::Searching;
-
-        if self.try_load_local_lrc() {
+        // Check if the playing track originates from a blacklisted directory
+        if self.matcher.is_track_blacklisted(&self.current_query) {
+            self.current_lrc = None;
+            self.current_lrc_path = None;
+            self.current_lrc_mtime = None;
+            self.ui.lookup_status = LookupStatus::Disabled;
+            self.retry_attempt = 0;
+            self.next_retry_at = None;
             return;
         }
 
-        // Local match not found: dispatch remote fallback chain in priority order
+        self.ui.lookup_status = LookupStatus::Searching;
+
+        let local_outcome = self.try_load_local_lrc();
+        if local_outcome == LocalLoadOutcome::Loaded {
+            return;
+        }
+
+        let settings = self.settings_mgr.settings().clone();
+        if local_outcome == LocalLoadOutcome::FailedVerification && !settings.rescan_failed_lyrics {
+            self.current_lrc = None;
+            self.current_lrc_path = None;
+            self.current_lrc_mtime = None;
+            self.ui.lookup_status = LookupStatus::NotFound;
+            return;
+        }
+
+        // Local match not found (or failed verification with `rescan_failed_lyrics = true`):
+        // dispatch remote fallback chain in priority order
         if !preserve_existing_on_pending {
             self.current_lrc = None;
             self.current_lrc_path = None;
             self.current_lrc_mtime = None;
         }
-        let settings = self.settings_mgr.settings().clone();
+        let bypass_cache =
+            force_bypass_cache || local_outcome == LocalLoadOutcome::FailedVerification;
         if !settings.enabled_fallback_providers().is_empty() {
             self.ui.lookup_status = LookupStatus::Searching;
             self.fallback_worker.request(
                 self.current_query.clone(),
                 self.current_track_length,
                 settings,
+                bypass_cache,
             );
         } else {
             self.ui.lookup_status = LookupStatus::NotFound;
@@ -174,16 +235,26 @@ impl App {
         }
         self.last_local_hot_reload_check = Instant::now();
 
-        if self.current_query.is_empty() {
+        if self.current_query.is_empty()
+            || self.ui.lookup_status == LookupStatus::Disabled
+            || self.matcher.is_track_blacklisted(&self.current_query)
+        {
             return;
         }
+
+        let verify_lyrics = self.settings_mgr.settings().verify_lyrics;
 
         // Case 1: Already displaying a local `.lrc` file — check if it was modified on disk
         if let Some(ref path) = self.current_lrc_path.clone() {
             if let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) {
                 if self.current_lrc_mtime != Some(mtime) {
-                    if let Ok(parsed) = ParsedLrc::from_file(path) {
-                        if !parsed.lines.is_empty() {
+                    if let Ok(mut parsed) = ParsedLrc::from_file(path) {
+                        let valid = if verify_lyrics {
+                            parsed.verify_and_clean()
+                        } else {
+                            !parsed.lines.is_empty()
+                        };
+                        if valid {
                             self.set_local_lrc(path.clone(), parsed);
                         }
                     }
@@ -194,7 +265,7 @@ impl App {
 
         // Case 2: No local `.lrc` was loaded yet (either waiting/not found or showing remote lyrics)
         // Check if a sibling `.lrc` or new `.lrc` in `lyrics_dir` has appeared on disk
-        if self.try_load_local_lrc() {
+        if self.try_load_local_lrc() == LocalLoadOutcome::Loaded {
             self.kitty.invalidate();
         }
     }
@@ -216,8 +287,12 @@ impl App {
             self.tracker
                 .update_config(updated.player.clone(), updated.mpris_poll_ms);
             let new_dir = updated.resolved_lyrics_dir(&self.cli);
-            if self.matcher.update_config(new_dir, updated.match_threshold) {
-                self.match_current_track(true);
+            let new_blacklist = updated.resolved_blacklist_dirs();
+            if self
+                .matcher
+                .update_config(new_dir, updated.match_threshold, new_blacklist)
+            {
+                self.match_current_track(true, false);
             }
         }
 
@@ -238,7 +313,7 @@ impl App {
                 self.ui.reset_for_new_track();
                 self.retry_attempt = 0;
                 self.next_retry_at = None;
-                self.match_current_track(false);
+                self.match_current_track(false, false);
             }
         } else {
             self.current_track_length = snap.length;
@@ -251,7 +326,9 @@ impl App {
                     if query.is_same_track(&self.current_query, None, None)
                         || query == self.current_query
                     {
-                        if self.current_lrc.is_none() {
+                        if self.current_lrc.is_none()
+                            && self.ui.lookup_status != LookupStatus::Disabled
+                        {
                             self.ui.lookup_status = status;
                             self.kitty.invalidate();
                         }
@@ -262,8 +339,9 @@ impl App {
                     lrc,
                     rate_limited,
                 } => {
-                    if query.is_same_track(&self.current_query, None, None)
-                        || query == self.current_query
+                    if (query.is_same_track(&self.current_query, None, None)
+                        || query == self.current_query)
+                        && self.ui.lookup_status != LookupStatus::Disabled
                     {
                         if let Some(fetched_lrc) = lrc {
                             let s = self.settings_mgr.settings().clone();
@@ -274,6 +352,7 @@ impl App {
                                     &fetched_lrc,
                                     s.save_lrc_threshold,
                                     s.local_only_lyrics,
+                                    s.verify_lyrics,
                                 )
                             } else {
                                 None
@@ -281,8 +360,14 @@ impl App {
 
                             if let Some(path) = saved_path {
                                 // Instantly hot-reload the newly downloaded `.lrc` file from disk
-                                let reloaded =
-                                    ParsedLrc::from_file(&path).unwrap_or(fetched_lrc);
+                                let mut reloaded =
+                                    ParsedLrc::from_file(&path).unwrap_or_else(|_| fetched_lrc.clone());
+                                if reloaded.source_label.is_none() {
+                                    reloaded.source_label = fetched_lrc.source_label.clone();
+                                }
+                                if s.verify_lyrics {
+                                    let _ = reloaded.verify_and_clean();
+                                }
                                 self.set_local_lrc(path, reloaded);
                             } else if s.local_only_lyrics {
                                 // `local_only_lyrics` is enabled, and the remote result could not be saved locally
@@ -319,7 +404,10 @@ impl App {
         self.poll_local_lrc_hot_reload();
 
         // Trigger scheduled retry if lookup previously failed and backoff timer elapsed
-        if self.current_lrc.is_none() && !self.current_query.is_empty() {
+        if self.current_lrc.is_none()
+            && !self.current_query.is_empty()
+            && self.ui.lookup_status != LookupStatus::Disabled
+        {
             if let Some(retry_at) = self.next_retry_at {
                 if Instant::now() >= retry_at {
                     self.next_retry_at = None;
@@ -331,6 +419,7 @@ impl App {
                             self.current_query.clone(),
                             self.current_track_length,
                             settings,
+                            false,
                         );
                     }
                 }

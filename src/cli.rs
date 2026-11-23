@@ -61,4 +61,16 @@ pub struct Cli {
     /// Only display lyrics that exist as or have been downloaded to a local `.lrc` file (overrides config.toml).
     #[arg(long = "local-only", alias = "local-only-lyrics")]
     pub local_only_lyrics: Option<bool>,
+
+    /// Show where the lyrics for each song are sourced from above the lyrics (overrides config.toml).
+    #[arg(long = "show-source", alias = "show-lyrics-source")]
+    pub show_lyrics_source: Option<bool>,
+
+    /// Enable or disable lyrics verification against credit-only/non-lyric placeholders (overrides config.toml).
+    #[arg(long = "verify-lyrics")]
+    pub verify_lyrics: Option<bool>,
+
+    /// Automatically rescan remote providers when a local `.lrc` file fails lyrics verification (overrides config.toml).
+    #[arg(long = "rescan-failed", alias = "rescan-failed-lyrics")]
+    pub rescan_failed_lyrics: Option<bool>,
 }

@@ -58,6 +58,10 @@ pub struct UiState {
     pub empty_line_symbol: String,
     /// Symbol shown when waiting for a song or when no matching LRC is loaded.
     pub idle_symbol: String,
+    /// Whether to display the lyric source label above the first lyric line.
+    pub show_lyrics_source: bool,
+    /// Customizable message displayed when playing from a blacklisted directory.
+    pub lyrics_disabled_text: String,
     /// Manual scroll override offset (in lines) when user scrolls with Up/Down keys;
     /// resets automatically when the active lyric line advances.
     pub manual_line_offset: isize,
@@ -92,6 +96,8 @@ impl UiState {
             active_marker: s.active_marker.clone(),
             empty_line_symbol: s.empty_line_symbol.clone(),
             idle_symbol: s.idle_symbol.clone(),
+            show_lyrics_source: s.show_lyrics_source,
+            lyrics_disabled_text: s.lyrics_disabled_text.clone(),
             manual_line_offset: 0,
             lookup_status: LookupStatus::Idle,
             last_active_index: None,
@@ -120,6 +126,8 @@ impl UiState {
         self.active_marker = s.active_marker.clone();
         self.empty_line_symbol = s.empty_line_symbol.clone();
         self.idle_symbol = s.idle_symbol.clone();
+        self.show_lyrics_source = s.show_lyrics_source;
+        self.lyrics_disabled_text = s.lyrics_disabled_text.clone();
     }
 
     pub fn reset_for_new_track(&mut self) {
@@ -218,6 +226,7 @@ pub fn draw(frame: &mut Frame, lrc: Option<&ParsedLrc>, sync: &LyricSyncState, u
                     LookupStatus::Searching => "Searching",
                     LookupStatus::RateLimited => "Rate limited",
                     LookupStatus::NotFound => "Lyrics not found",
+                    LookupStatus::Disabled => ui.lyrics_disabled_text.as_str(),
                     LookupStatus::Downloading { .. } => "Downloading",
                 };
                 if !msg.is_empty() {
@@ -308,29 +317,31 @@ pub fn draw(frame: &mut Frame, lrc: Option<&ParsedLrc>, sync: &LyricSyncState, u
         }
     }
 
-    if let Some(ref source_label) = parsed.source_label {
-        let label_y = if !ui.empty_line_symbol.is_empty() {
-            -top_step - base_step.max(2.0)
-        } else {
-            -top_step
-        };
-        let rel_y = (label_y - camera_y).round() as isize;
-        let screen_y = center_row + rel_y;
-        if screen_y >= 0 && screen_y < viewport_h {
-            let row_rect = Rect {
-                x: area.x,
-                y: area.y + screen_y as u16,
-                width: area.width,
-                height: 1,
+    if ui.show_lyrics_source {
+        if let Some(ref source_label) = parsed.source_label {
+            let label_y = if sync.active_index.is_none() && !ui.empty_line_symbol.is_empty() {
+                -top_step - base_step.max(2.0)
+            } else {
+                -top_step
             };
-            frame.render_widget(
-                Paragraph::new(Span::styled(
-                    source_label.as_str(),
-                    Style::default().add_modifier(Modifier::DIM),
-                ))
-                .alignment(ui.alignment),
-                row_rect,
-            );
+            let rel_y = (label_y - camera_y).round() as isize;
+            let screen_y = center_row + rel_y;
+            if screen_y >= 0 && screen_y < viewport_h {
+                let row_rect = Rect {
+                    x: area.x,
+                    y: area.y + screen_y as u16,
+                    width: area.width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        source_label.as_str(),
+                        Style::default().add_modifier(Modifier::DIM),
+                    ))
+                    .alignment(ui.alignment),
+                    row_rect,
+                );
+            }
         }
     }
 

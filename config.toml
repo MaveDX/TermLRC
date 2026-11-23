@@ -100,8 +100,30 @@ empty_line_symbol = "♪"
 # Symbol displayed when waiting for a song or when no matching .lrc is found (set to "" for blank)
 idle_symbol = "♪"
 
+# Display where the lyrics for each song are sourced from (e.g. "Lyrics from lrcmux", "Lyrics from Local LRC") above the first lyric line
+show_lyrics_source = true
+
 # How often to poll D-Bus MPRIS for track/position updates in milliseconds (50 - 2000)
 mpris_poll_ms = 250
+
+# -----------------------------------------------------------------------------
+# Directory Blacklist & Lyrics Verification
+# -----------------------------------------------------------------------------
+
+# Directories blacklisted from lyrics search. When music is playing from any of these
+# folders (or their subfolders), TermLRC will skip local/remote lookup and display `lyrics_disabled_text`.
+# Example: blacklist_dirs = ["/mnt/Media/Podcasts", "~/Music/Instrumental"]
+blacklist_dirs = []
+
+# Customizable status text displayed when music is playing from a blacklisted directory
+lyrics_disabled_text = "Lyrics Disabled"
+
+# Verify lyrics and filter out bogus metadata-only / Chinese artist-credit placeholders
+# (such as "作曲 : ...", "作词 : ...", "纯音乐，请欣赏") that contain no actual song lyrics
+verify_lyrics = true
+
+# Automatically discard and rescan remote providers when a local/downloaded .lrc file fails verification
+rescan_failed_lyrics = true
 
 # -----------------------------------------------------------------------------
 # Local & Remote Fallback Lyric Matching

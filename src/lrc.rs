@@ -13,12 +13,13 @@ fn default_match_score() -> f64 {
     1.0
 }
 
-/// Metadata extracted from LRC header tags (`[ti:]`, `[ar:]`, `[al:]`, `[offset:]`).
+/// Metadata extracted from LRC header tags (`[ti:]`, `[ar:]`, `[al:]`, `[src:]`, `[offset:]`).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LrcMetadata {
     pub title: Option<String>,
     pub artist: Option<String>,
     pub album: Option<String>,
+    pub source: Option<String>,
     /// Offset in milliseconds from `[offset:+/-ms]` tag.
     pub offset_ms: i64,
 }
@@ -87,13 +88,24 @@ impl ParsedLrc {
             .with_context(|| format!("Failed to read LRC file: {}", path.display()))?;
         let content = String::from_utf8_lossy(&bytes);
         let parsed = Self::parse(&content);
-        if parsed.lines.len() >= 2 {
-            Ok(parsed)
+        let mut out = if parsed.lines.len() >= 2 {
+            parsed
         } else {
             let mut plain = Self::from_plain_text(&content);
             plain.metadata = parsed.metadata;
-            Ok(plain)
-        }
+            plain
+        };
+        out.source_label = Some(match out.metadata.source.as_deref().map(str::trim) {
+            Some(src) if !src.is_empty() => {
+                if src.starts_with("Lyrics from ") {
+                    src.to_string()
+                } else {
+                    format!("Lyrics from {}", src)
+                }
+            }
+            _ => String::from("Lyrics from Local LRC"),
+        });
+        Ok(out)
     }
 
     /// Read only the metadata headers from an LRC file quickly for indexing/matching
@@ -165,12 +177,15 @@ impl ParsedLrc {
                 parse_metadata_tag(trimmed, &mut metadata);
                 continue;
             }
-            if trimmed.is_empty() {
+            let (_, remainder) = extract_line_timestamps(trimmed);
+            let (clean_text, _) = parse_enhanced_segments(remainder);
+            let clean_trimmed = clean_text.trim();
+            if clean_trimmed.is_empty() {
                 continue;
             }
             lines.push(LyricLine {
                 timestamp: Duration::ZERO,
-                text: trimmed.to_string(),
+                text: clean_trimmed.to_string(),
                 segments: Vec::new(),
             });
         }
@@ -200,6 +215,16 @@ impl ParsedLrc {
             if !al.trim().is_empty() {
                 out.push_str(&format!("[al:{}]\n", al.trim()));
             }
+        }
+        let persisted_source = self
+            .metadata
+            .source
+            .as_deref()
+            .or(self.source_label.as_deref())
+            .map(|s| s.trim().strip_prefix("Lyrics from ").unwrap_or(s.trim()))
+            .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("Local LRC"));
+        if let Some(src) = persisted_source {
+            out.push_str(&format!("[src:{}]\n", src));
         }
         if self.metadata.offset_ms != 0 {
             out.push_str(&format!("[offset:{}]\n", self.metadata.offset_ms));
@@ -332,6 +357,256 @@ impl ParsedLrc {
             }
         }
     }
+
+    /// Verify that this `ParsedLrc` contains genuine lyrics rather than Chinese/CJK artist credits,
+    /// production metadata rosters (e.g. `作曲 : ...`, `作词 : ...`), or `"纯音乐，请欣赏"` placeholders.
+    ///
+    /// Strips credit/metadata-only lines in-place and returns `true` if valid lyrics remain,
+    /// or `false` if the lyric sheet is empty or consists only of non-lyric metadata.
+    pub fn verify_and_clean(&mut self) -> bool {
+        for line in &mut self.lines {
+            let (_, stripped) = extract_line_timestamps(line.text.trim());
+            if stripped.len() != line.text.len() {
+                line.text = stripped.to_string();
+            }
+        }
+
+        self.lines
+            .retain(|line| !is_credit_or_non_lyric_line(&line.text));
+
+        let non_empty_count = self
+            .lines
+            .iter()
+            .filter(|l| !l.text.trim().is_empty())
+            .count();
+
+        if non_empty_count < 2 {
+            return false;
+        }
+
+        if self.is_synced {
+            let has_positive_ts = self
+                .lines
+                .iter()
+                .any(|l| l.timestamp > Duration::from_millis(100));
+            if !has_positive_ts {
+                self.is_synced = false;
+            }
+        }
+
+        true
+    }
+}
+
+/// Detect whether a single lyric line is actually a Chinese/CJK/English production credit,
+/// artist roster (e.g. `作曲 : Oliver Sykes/Lee Malia/...`, `作词 : ...`), or instrumental placeholder.
+pub fn is_credit_or_non_lyric_line(raw_text: &str) -> bool {
+    let (_, after_ts) = extract_line_timestamps(raw_text.trim());
+    let text = after_ts.trim();
+    if text.is_empty() {
+        return false;
+    }
+
+    let lower = text.to_lowercase();
+
+    // 1. Instrumental / "No lyrics" placeholder sentences common on NetEase / KuGou / LRCLIB
+    const INSTRUMENTAL_PLACEHOLDERS: &[&str] = &[
+        "纯音乐，请欣赏",
+        "纯音乐,请欣赏",
+        "纯音乐 请欣赏",
+        "此歌曲为没有填词的纯音乐",
+        "没有填词的纯音乐",
+        "纯音乐无歌词",
+        "暂无歌词",
+        "没有歌词",
+        "无歌词",
+        "纯音乐",
+    ];
+    for &ph in INSTRUMENTAL_PLACEHOLDERS {
+        if lower == ph || lower.contains("纯音乐，请欣赏") || lower.contains("没有填词的纯音乐")
+        {
+            return true;
+        }
+    }
+
+    // 2. Credit prefix followed by ':' or '：' (e.g. "作曲 : ...", "作词：...", "编曲 : ...", "词/曲：...")
+    if let Some((left, right)) = text.split_once([':', '：']) {
+        let role = left
+            .trim()
+            .trim_start_matches(|c: char| matches!(c, '(' | '[' | '【' | '《' | '-' | '*' | ' '))
+            .trim_end_matches(|c: char| matches!(c, ')' | ']' | '】' | '》' | ' '));
+
+        if !role.is_empty() && role.chars().count() <= 24 {
+            if is_credit_role_label(role) {
+                return true;
+            }
+            // Also check compound roles separated by '/', '&', '、', ',' (e.g. "作词/作曲", "混音/母带")
+            let parts: Vec<&str> = role
+                .split(['/', '&', '、', ',', '，', '+'])
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !parts.is_empty() && parts.iter().all(|p| is_credit_role_label(p)) {
+                return true;
+            }
+        }
+
+        // If the right side after a colon is a slash-separated list of 3+ credit names (e.g. "A/B/C/D")
+        let slash_count = right.chars().filter(|&c| c == '/').count();
+        if slash_count >= 3 && role.chars().count() <= 16 {
+            return true;
+        }
+    }
+
+    // 3. Standalone slash-separated credit roster with 4+ slashes (e.g. "Oliver Sykes/Lee Malia/Matthew Nicholls/Dan Lancaster/Zakk Cervini")
+    let slash_segments: Vec<&str> = text.split('/').map(str::trim).filter(|s| !s.is_empty()).collect();
+    if slash_segments.len() >= 5
+        && slash_segments
+            .iter()
+            .all(|seg| seg.chars().count() <= 35 && !seg.contains(['?', '!', '。', '，']))
+    {
+        return true;
+    }
+
+    false
+}
+
+fn is_credit_role_label(label: &str) -> bool {
+    let clean = label.trim().to_lowercase();
+    const CREDIT_ROLES: &[&str] = &[
+        "作曲",
+        "作词",
+        "作詞",
+        "编曲",
+        "編曲",
+        "制作人",
+        "製作人",
+        "制作",
+        "製作",
+        "词曲",
+        "詞曲",
+        "词",
+        "詞",
+        "曲",
+        "编",
+        "編",
+        "混音",
+        "混音师",
+        "母带",
+        "母帶",
+        "母带后期",
+        "母带工程师",
+        "录音",
+        "錄音",
+        "录音师",
+        "录音室",
+        "录音棚",
+        "缩混",
+        "混缩",
+        "后期",
+        "吉他",
+        "木吉他",
+        "电吉他",
+        "贝斯",
+        "鼓",
+        "打击乐",
+        "和声",
+        "和聲",
+        "和音",
+        "和声编写",
+        "弦乐",
+        "弦樂",
+        "弦乐编写",
+        "管乐",
+        "键盘",
+        "钢琴",
+        "合成器",
+        "乐器",
+        "配唱",
+        "配唱制作人",
+        "人声",
+        "人聲",
+        "人声编辑",
+        "音频编辑",
+        "统筹",
+        "音乐统筹",
+        "监制",
+        "監製",
+        "总策划",
+        "策划",
+        "企划",
+        "企劃",
+        "出品",
+        "出品人",
+        "出品方",
+        "出品公司",
+        "发行",
+        "發行",
+        "发行方",
+        "发行公司",
+        "宣发",
+        "宣传",
+        "推广",
+        "营销",
+        "封面",
+        "封面设计",
+        "美工",
+        "视觉",
+        "海报",
+        "文案",
+        "设计",
+        "题字",
+        "曲绘",
+        "调校",
+        "视频",
+        "映像",
+        "原唱",
+        "翻唱",
+        "演唱",
+        "歌手",
+        "艺人",
+        "合唱",
+        "独唱",
+        "伴奏",
+        "制作团队",
+        "音乐制作",
+        "版权",
+        "版权方",
+        "鸣谢",
+        "特别鸣谢",
+        "op",
+        "sp",
+        "tw",
+        "pv",
+        "cv",
+        "composer",
+        "composed by",
+        "lyricist",
+        "lyrics",
+        "lyrics by",
+        "written by",
+        "arranger",
+        "arranged by",
+        "arrangement",
+        "producer",
+        "produced by",
+        "production",
+        "mixed by",
+        "mixing",
+        "mastered by",
+        "mastering",
+        "recorded by",
+        "recording",
+        "vocals",
+        "vocals by",
+        "guitar",
+        "bass",
+        "drums",
+        "strings",
+        "published by",
+        "publisher",
+    ];
+    CREDIT_ROLES.contains(&clean.as_str())
 }
 
 fn compute_karaoke_progress(
@@ -412,13 +687,24 @@ fn format_lrc_timestamp(d: Duration) -> String {
     format!("{:02}:{:02}.{:02}", mins, secs, cs)
 }
 
-/// Parse a timestamp string like `01:23.45`, `01:23.456`, `01:23:45`, or `01:23`.
+/// Parse a timestamp string like `01:23.45`, `01:23.456`, `01:23.45-1`, `01:23:45`, or `01:23`.
 fn parse_timestamp(s: &str) -> Option<Duration> {
     let s = s.trim();
     let (mins_str, rest) = s.split_once(':')?;
     let mins: u64 = mins_str.trim().parse().ok()?;
 
-    let (secs, nanos) = if let Some((sec_str, frac_str)) = rest.split_once(['.', ':']) {
+    // Strip any trailing NetEase/YRC line-index suffix like `-1` or `-0` (e.g. `00:00.00-1`)
+    let rest_clean = match rest.split_once('-') {
+        Some((before_dash, after_dash))
+            if !after_dash.trim().is_empty()
+                && after_dash.trim().chars().all(|c| c.is_ascii_digit()) =>
+        {
+            before_dash
+        }
+        _ => rest,
+    };
+
+    let (secs, nanos) = if let Some((sec_str, frac_str)) = rest_clean.split_once(['.', ':']) {
         let secs: u64 = sec_str.trim().parse().ok()?;
         let frac_trimmed = frac_str.trim();
         if frac_trimmed.is_empty() || !frac_trimmed.chars().all(|c| c.is_ascii_digit()) {
@@ -436,14 +722,14 @@ fn parse_timestamp(s: &str) -> Option<Duration> {
         };
         (secs, nanos as u32)
     } else {
-        let secs: u64 = rest.trim().parse().ok()?;
+        let secs: u64 = rest_clean.trim().parse().ok()?;
         (secs, 0)
     };
 
     Some(Duration::new(mins * 60 + secs, nanos))
 }
 
-/// Parse metadata tags like `[ti:Song Title]`, `[ar:Artist]`, `[al:Album]`, `[offset:+200]`.
+/// Parse metadata tags like `[ti:Song Title]`, `[ar:Artist]`, `[al:Album]`, `[src:Provider]`, `[offset:+200]`.
 fn parse_metadata_tag(line: &str, meta: &mut LrcMetadata) {
     let Some(inner) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) else {
         return;
@@ -460,6 +746,7 @@ fn parse_metadata_tag(line: &str, meta: &mut LrcMetadata) {
         "ti" | "title" => meta.title = Some(val.to_string()),
         "ar" | "artist" => meta.artist = Some(val.to_string()),
         "al" | "album" => meta.album = Some(val.to_string()),
+        "src" | "source" => meta.source = Some(val.to_string()),
         "offset" => {
             if let Ok(offset) = val.parse::<i64>() {
                 meta.offset_ms = offset;
@@ -569,6 +856,40 @@ mod tests {
         assert_eq!(parsed.lines[0].segments.len(), 2);
         assert_eq!(parsed.lines[0].segments[0].text, "Hello ");
         assert_eq!(parsed.lines[0].segments[1].text, "world");
+    }
+
+    #[test]
+    fn test_lyrics_verification_rejects_chinese_credits_and_cleans_headers() {
+        // 1. Exact case from user screenshot: NetEase suffixed timestamp + Chinese composer credit roster only
+        let bogus_credits = "[00:00.00-1] 作曲 : Oliver Sykes/Lee Malia/Matthew Nicholls/Dan Lancaster/Zakk Cervini/Sione Teumohenga/Daisuke Ehara\n";
+        let mut parsed_bogus = ParsedLrc::parse(bogus_credits);
+        assert!(!parsed_bogus.verify_and_clean());
+
+        let mut plain_bogus = ParsedLrc::from_plain_text(bogus_credits);
+        assert!(!plain_bogus.verify_and_clean());
+
+        // 2. Multi-line Chinese credit-only placeholder (composer + lyricist + instrumental notice)
+        let multi_credits = "\
+[00:00.00] 作词 : 某某
+[00:00.50] 作曲 : 某某
+[00:01.00] 编曲 : 某某
+[00:02.00] 纯音乐，请欣赏
+";
+        let mut parsed_multi = ParsedLrc::parse(multi_credits);
+        assert!(!parsed_multi.verify_and_clean());
+
+        // 3. Valid lyrics that happen to start with Chinese credit lines: credits are stripped, real lyrics pass!
+        let mixed_valid = "\
+[00:00.00-1] 作曲 : Oliver Sykes/Lee Malia/Matthew Nicholls/Dan Lancaster
+[00:01.00] 作词 : Oliver Sykes
+[00:12.50] Can you feel my heart?
+[00:16.20] Can you hear the silence?
+[00:20.00] Can you see the dark?
+";
+        let mut parsed_valid = ParsedLrc::parse(mixed_valid);
+        assert!(parsed_valid.verify_and_clean());
+        assert_eq!(parsed_valid.lines.len(), 3);
+        assert_eq!(parsed_valid.lines[0].text, "Can you feel my heart?");
     }
 
     #[test]

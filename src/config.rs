@@ -79,7 +79,20 @@ pub struct Settings {
     pub active_marker: String,
     pub empty_line_symbol: String,
     pub idle_symbol: String,
+    #[serde(alias = "show_source", alias = "display_source")]
+    pub show_lyrics_source: bool,
     pub mpris_poll_ms: u64,
+    #[serde(
+        alias = "blacklisted_dirs",
+        alias = "disabled_dirs",
+        alias = "ignore_dirs"
+    )]
+    pub blacklist_dirs: Vec<String>,
+    #[serde(alias = "disabled_text", alias = "blacklist_text")]
+    pub lyrics_disabled_text: String,
+    pub verify_lyrics: bool,
+    #[serde(alias = "rescan_invalid_lyrics")]
+    pub rescan_failed_lyrics: bool,
     pub match_threshold: f64,
     pub fallback_match_threshold: f64,
     pub prefer_uncensored: bool,
@@ -134,7 +147,12 @@ impl Default for Settings {
             active_marker: String::new(),
             empty_line_symbol: String::from("♪"),
             idle_symbol: String::from("♪"),
+            show_lyrics_source: true,
             mpris_poll_ms: 250,
+            blacklist_dirs: Vec::new(),
+            lyrics_disabled_text: String::from("Lyrics Disabled"),
+            verify_lyrics: true,
+            rescan_failed_lyrics: true,
             match_threshold: 0.62,
             fallback_match_threshold: 0.72,
             prefer_uncensored: true,
@@ -273,7 +291,25 @@ impl Settings {
         if let Some(local_only) = cli.local_only_lyrics {
             self.local_only_lyrics = local_only;
         }
+        if let Some(show_src) = cli.show_lyrics_source {
+            self.show_lyrics_source = show_src;
+        }
+        if let Some(verify) = cli.verify_lyrics {
+            self.verify_lyrics = verify;
+        }
+        if let Some(rescan_failed) = cli.rescan_failed_lyrics {
+            self.rescan_failed_lyrics = rescan_failed;
+        }
         *self = self.clone().sanitized();
+    }
+
+    pub fn resolved_blacklist_dirs(&self) -> Vec<PathBuf> {
+        self.blacklist_dirs
+            .iter()
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| expand_tilde(&PathBuf::from(s)))
+            .collect()
     }
 }
 

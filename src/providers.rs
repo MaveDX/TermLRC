@@ -36,6 +36,7 @@ pub enum LookupStatus {
     Downloading { progress: f32 },
     RateLimited,
     NotFound,
+    Disabled,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -118,8 +119,19 @@ impl ProviderCaches {
         state.last_request = Some(Instant::now());
     }
 
-    fn get_cached_lyrics(&self, key: &str) -> Option<ParsedLrc> {
-        self.lyric_cache.get(key).cloned()
+    fn get_cached_lyrics(&self, key: &str, verify_lyrics: bool) -> Option<ParsedLrc> {
+        let mut cached = self.lyric_cache.get(key).cloned()?;
+        if verify_lyrics && !cached.verify_and_clean() {
+            return None;
+        }
+        Some(cached)
+    }
+
+    fn remove_cached_lyrics(&mut self, key: &str) {
+        if self.lyric_cache.remove(key).is_some() {
+            self.lyric_cache_order.retain(|k| k != key);
+            self.save_to_disk();
+        }
     }
 
     fn insert_cached_lyrics(&mut self, key: String, lrc: ParsedLrc) {
@@ -240,6 +252,7 @@ pub struct FallbackRequest {
     pub query: TrackQuery,
     pub track_length: Option<Duration>,
     pub settings: Settings,
+    pub bypass_cache: bool,
 }
 
 pub enum FallbackEvent {
@@ -283,6 +296,7 @@ impl FallbackWorker {
                     &req.query,
                     req.track_length,
                     &req.settings,
+                    req.bypass_cache,
                     &mut caches,
                     &res_tx,
                 );
@@ -300,11 +314,18 @@ impl FallbackWorker {
         }
     }
 
-    pub fn request(&self, query: TrackQuery, track_length: Option<Duration>, settings: Settings) {
+    pub fn request(
+        &self,
+        query: TrackQuery,
+        track_length: Option<Duration>,
+        settings: Settings,
+        bypass_cache: bool,
+    ) {
         let _ = self.tx.send(FallbackRequest {
             query,
             track_length,
             settings,
+            bypass_cache,
         });
     }
 
@@ -394,6 +415,7 @@ fn fetch_from_fallback_chain(
     raw_query: &TrackQuery,
     track_length: Option<Duration>,
     settings: &Settings,
+    bypass_cache: bool,
     caches: &mut ProviderCaches,
     event_tx: &Sender<FallbackEvent>,
 ) -> (Option<ParsedLrc>, bool) {
@@ -402,8 +424,12 @@ fn fetch_from_fallback_chain(
     }
 
     let cache_key = build_query_cache_key(raw_query, settings);
-    if let Some(cached) = caches.get_cached_lyrics(&cache_key) {
+    if bypass_cache {
+        caches.remove_cached_lyrics(&cache_key);
+    } else if let Some(cached) = caches.get_cached_lyrics(&cache_key, settings.verify_lyrics) {
         return (Some(cached), false);
+    } else {
+        caches.remove_cached_lyrics(&cache_key);
     }
 
     let lookup = prepare_lookup_metadata(raw_query, track_length, settings, caches);
@@ -496,7 +522,9 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
         if cand.matches_playing_length {
             if let Some(ref synced) = cand.synced_lrc {
                 let mut out = synced.clone();
-                out.source_label = Some(format!("Lyrics from {}", cand.provider.display_name()));
+                let provider_name = cand.provider.display_name();
+                out.metadata.source = Some(provider_name.to_string());
+                out.source_label = Some(format!("Lyrics from {}", provider_name));
                 out.match_score = cand.score;
                 return Some(out);
             }
@@ -521,7 +549,9 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
         let best_idx = select_best_synced_by_consensus(&stripped);
         let (_, provider, winning_lrc, score) = synced_sources[best_idx];
         let mut out = winning_lrc.clone();
-        out.source_label = Some(format!("Lyrics from {}", provider.display_name()));
+        let provider_name = provider.display_name();
+        out.metadata.source = Some(provider_name.to_string());
+        out.source_label = Some(format!("Lyrics from {}", provider_name));
         out.match_score = score;
         return Some(out);
     }
@@ -529,7 +559,9 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
     // 3. Plain text is used only when nothing is synced
     for cand in candidates {
         if let Some(mut plain) = cand.plain_lrc {
-            plain.source_label = Some(format!("Lyrics from {}", cand.provider.display_name()));
+            let provider_name = cand.provider.display_name();
+            plain.metadata.source = Some(provider_name.to_string());
+            plain.source_label = Some(format!("Lyrics from {}", provider_name));
             plain.match_score = cand.score;
             return Some(plain);
         }
@@ -1198,8 +1230,9 @@ pub fn parse_lrcmux_or_kpoe_response(
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
     {
-        let parsed = ParsedLrc::parse(synced_str);
-        if is_valid_synced_lrc(&parsed) {
+        let mut parsed = ParsedLrc::parse(synced_str);
+        let verified = !settings.verify_lyrics || parsed.verify_and_clean();
+        if verified && is_valid_synced_lrc(&parsed) {
             let eff_dur = estimate_lrc_duration_secs(&parsed, explicit_dur);
             if !is_within_duration_bounds(lookup.target_duration, eff_dur) {
                 return None;
@@ -1218,8 +1251,9 @@ pub fn parse_lrcmux_or_kpoe_response(
     }
 
     // 2. Check for KPOE / LyricsPlus array or `lyrics.lines` array
-    if let Some(parsed) = parse_kpoe_lyrics_json(json) {
-        if is_valid_synced_lrc(&parsed) {
+    if let Some(mut parsed) = parse_kpoe_lyrics_json(json) {
+        let verified = !settings.verify_lyrics || parsed.verify_and_clean();
+        if verified && is_valid_synced_lrc(&parsed) {
             let eff_dur = estimate_lrc_duration_secs(&parsed, explicit_dur);
             if !is_within_duration_bounds(lookup.target_duration, eff_dur) {
                 return None;
@@ -1234,7 +1268,7 @@ pub fn parse_lrcmux_or_kpoe_response(
                 matches_playing_length: matches_len,
                 score: base_score,
             });
-        } else if !parsed.lines.is_empty() {
+        } else if verified && !parsed.lines.is_empty() {
             return Some(ProviderCandidate {
                 provider,
                 provider_order,
@@ -1254,8 +1288,9 @@ pub fn parse_lrcmux_or_kpoe_response(
         .and_then(|v| v.as_str())
         .filter(|s| !s.trim().is_empty())
     {
-        let plain = ParsedLrc::from_plain_text(plain_str);
-        if !plain.lines.is_empty() {
+        let mut plain = ParsedLrc::from_plain_text(plain_str);
+        let verified = !settings.verify_lyrics || plain.verify_and_clean();
+        if verified && !plain.lines.is_empty() {
             return Some(ProviderCandidate {
                 provider,
                 provider_order,
@@ -1492,7 +1527,8 @@ pub fn parse_lrclib_candidates(
             .filter(|s| !s.trim().is_empty())
         {
             let mut parsed = ParsedLrc::parse(synced_str);
-            if is_valid_synced_lrc(&parsed) {
+            let verified = !settings.verify_lyrics || parsed.verify_and_clean();
+            if verified && is_valid_synced_lrc(&parsed) {
                 if parsed.metadata.title.is_none() && !cand_title.is_empty() {
                     parsed.metadata.title = Some(cand_title.to_string());
                 }
@@ -1526,8 +1562,9 @@ pub fn parse_lrclib_candidates(
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
         {
-            let plain = ParsedLrc::from_plain_text(plain_str);
-            if !plain.lines.is_empty() {
+            let mut plain = ParsedLrc::from_plain_text(plain_str);
+            let verified = !settings.verify_lyrics || plain.verify_and_clean();
+            if verified && !plain.lines.is_empty() {
                 if best_plain.as_ref().map_or(true, |(prev_s, ..)| base_score > *prev_s) {
                     best_plain = Some((base_score, plain, cand_dur));
                 }
@@ -1691,8 +1728,9 @@ fn fetch_kugou_keyword(
             continue;
         };
         let lrc_text = String::from_utf8_lossy(&decoded_bytes);
-        let parsed = ParsedLrc::parse(&lrc_text);
-        if is_valid_synced_lrc(&parsed) {
+        let mut parsed = ParsedLrc::parse(&lrc_text);
+        let verified = !settings.verify_lyrics || parsed.verify_and_clean();
+        if verified && is_valid_synced_lrc(&parsed) {
             let eff_dur = estimate_lrc_duration_secs(&parsed, c_dur_secs);
             let len_matched = is_length_matched(track_length, eff_dur);
             return Some(ProviderCandidate {
@@ -1830,8 +1868,9 @@ fn fetch_netease_keyword(
         else {
             continue;
         };
-        let parsed = ParsedLrc::parse(lrc_str);
-        if is_valid_synced_lrc(&parsed) {
+        let mut parsed = ParsedLrc::parse(lrc_str);
+        let verified_synced = !settings.verify_lyrics || parsed.verify_and_clean();
+        if verified_synced && is_valid_synced_lrc(&parsed) {
             let eff_dur = estimate_lrc_duration_secs(&parsed, c_dur_secs);
             let len_matched = is_length_matched(track_length, eff_dur);
             return Some(ProviderCandidate {
@@ -1844,8 +1883,9 @@ fn fetch_netease_keyword(
                 score,
             });
         } else {
-            let plain = ParsedLrc::from_plain_text(lrc_str);
-            if !plain.lines.is_empty() {
+            let mut plain = ParsedLrc::from_plain_text(lrc_str);
+            let verified_plain = !settings.verify_lyrics || plain.verify_and_clean();
+            if verified_plain && !plain.lines.is_empty() {
                 return Some(ProviderCandidate {
                     provider: FallbackProviderKind::NetEase,
                     provider_order,
