@@ -1,6 +1,9 @@
 use crate::config::{data_cache_file_path, FallbackProviderKind, Settings};
 use crate::lrc::{LrcMetadata, LyricLine, ParsedLrc, TimedSegment};
-use crate::matcher::{clean_video_metadata, normalize, CleanedTrackMetadata, TrackQuery};
+use crate::matcher::{
+    artist_match_score, clean_video_metadata, normalize, title_match_score, CleanedTrackMetadata,
+    TrackQuery,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -119,9 +122,21 @@ impl ProviderCaches {
         state.last_request = Some(Instant::now());
     }
 
-    fn get_cached_lyrics(&self, key: &str, verify_lyrics: bool) -> Option<ParsedLrc> {
+    fn get_cached_lyrics(
+        &self,
+        key: &str,
+        query: &TrackQuery,
+        verify_lyrics: bool,
+    ) -> Option<ParsedLrc> {
         let mut cached = self.lyric_cache.get(key).cloned()?;
-        if verify_lyrics && !cached.verify_and_clean() {
+        if !cached.matches_track_identity(query) {
+            return None;
+        }
+        if verify_lyrics {
+            if !cached.verify_and_clean() {
+                return None;
+            }
+        } else if !cached.is_strictly_synced() {
             return None;
         }
         Some(cached)
@@ -184,13 +199,14 @@ impl ProviderCaches {
     }
 }
 
-/// Build a stable cache key from the cleaned track identity so small duration or album updates
-/// hit the same entry without invalidating found lyrics.
+/// Build a stable cache key from the cleaned track identity (including both primary and full artists)
+/// so two songs with the same title by different artists never share a cache entry.
 pub fn build_query_cache_key(query: &TrackQuery, settings: &Settings) -> String {
     let cleaned = clean_video_metadata(query);
     format!(
-        "{}|{}|{}",
+        "{}|{}|{}|{}",
         normalize(&cleaned.core_artist),
+        normalize(&cleaned.artist),
         normalize(&cleaned.core_title),
         settings.prefer_uncensored
     )
@@ -340,6 +356,7 @@ pub struct ProviderCandidate {
     pub provider: FallbackProviderKind,
     pub provider_order: usize,
     pub synced_lrc: Option<ParsedLrc>,
+    #[allow(dead_code)]
     pub plain_lrc: Option<ParsedLrc>,
     #[allow(dead_code)]
     pub duration_secs: Option<f64>,
@@ -426,7 +443,9 @@ fn fetch_from_fallback_chain(
     let cache_key = build_query_cache_key(raw_query, settings);
     if bypass_cache {
         caches.remove_cached_lyrics(&cache_key);
-    } else if let Some(cached) = caches.get_cached_lyrics(&cache_key, settings.verify_lyrics) {
+    } else if let Some(cached) =
+        caches.get_cached_lyrics(&cache_key, raw_query, settings.verify_lyrics)
+    {
         return (Some(cached), false);
     } else {
         caches.remove_cached_lyrics(&cache_key);
@@ -554,17 +573,6 @@ pub fn select_best_candidate(candidates: Vec<ProviderCandidate>) -> Option<Parse
         out.source_label = Some(format!("Lyrics from {}", provider_name));
         out.match_score = score;
         return Some(out);
-    }
-
-    // 3. Plain text is used only when nothing is synced
-    for cand in candidates {
-        if let Some(mut plain) = cand.plain_lrc {
-            let provider_name = cand.provider.display_name();
-            plain.metadata.source = Some(provider_name.to_string());
-            plain.source_label = Some(format!("Lyrics from {}", provider_name));
-            plain.match_score = cand.score;
-            return Some(plain);
-        }
     }
 
     None
@@ -851,23 +859,12 @@ fn identify_recording_deezer_or_musicbrainz(
 
 /// Strictly verify that the parsed LRC contains genuine synced timestamps.
 pub fn is_valid_synced_lrc(lrc: &ParsedLrc) -> bool {
-    if !lrc.is_synced || lrc.lines.len() < 2 {
-        return false;
-    }
-    let non_empty_timed = lrc
-        .lines
-        .iter()
-        .filter(|l| !l.text.trim().is_empty())
-        .count();
-    let has_positive_ts = lrc
-        .lines
-        .iter()
-        .any(|l| l.timestamp > Duration::from_millis(100));
-    non_empty_timed >= 2 && has_positive_ts
+    lrc.is_strictly_synced()
 }
 
 /// Score a remote track candidate against the `TrackQuery`.
-/// Rejects unrelated/ambiguous recordings and recordings differing by > 30s from the playing track.
+/// Strictly validates both song title and artist identity so two songs with the same title
+/// by different artists never match each other, and rejects recordings differing by > 30s.
 pub fn score_remote_metadata(
     query: &TrackQuery,
     cand_title: &str,
@@ -880,28 +877,21 @@ pub fn score_remote_metadata(
         return 0.0;
     }
 
+    let title_sim = title_match_score(query, cand_title);
+    if title_sim < 0.72 {
+        return 0.0;
+    }
+
     let q_clean = clean_video_metadata(query);
-    let q_title = normalize(&q_clean.core_title);
-    let c_title = normalize(cand_title);
-    if q_title.is_empty() || c_title.is_empty() {
-        return 0.0;
-    }
-
-    let title_sim = string_similarity(&q_title, &c_title)
-        .max(string_similarity(&normalize(&query.title), &c_title));
-
-    // Reject unrelated songs whose title doesn't even loosely match
-    if title_sim < 0.58 {
-        return 0.0;
-    }
-
-    let q_artist = normalize(&q_clean.core_artist);
-    let c_artist = normalize(cand_artist);
-    let artist_sim = if !q_artist.is_empty() && !c_artist.is_empty() {
-        let sim = string_similarity(&q_artist, &c_artist)
-            .max(string_similarity(&normalize(&q_clean.artist), &c_artist));
-        if sim < 0.45 {
-            // Unrelated artist
+    let has_query_artist = !q_clean.core_artist.trim().is_empty();
+    let artist_sim = if has_query_artist {
+        if cand_artist.trim().is_empty() {
+            // Never allow an untagged/artistless candidate to hijack a track with a known artist
+            return 0.0;
+        }
+        let sim = artist_match_score(query, cand_artist);
+        if sim < 0.72 {
+            // Different artist with the same song title -> reject
             return 0.0;
         }
         sim
@@ -909,7 +899,7 @@ pub fn score_remote_metadata(
         0.75
     };
 
-    let mut score = title_sim * 0.65 + artist_sim * 0.35;
+    let mut score = title_sim * 0.60 + artist_sim * 0.40;
 
     if let (Some(q_al), Some(c_al)) = (query.album.as_deref(), cand_album) {
         let q_al_n = normalize(q_al);
@@ -1206,7 +1196,21 @@ pub fn parse_lrcmux_or_kpoe_response(
         .get("artistName")
         .or_else(|| json.get("artist"))
         .or_else(|| json.pointer("/metadata/artist"))
+        .or_else(|| json.pointer("/metadata/artists/0"))
         .and_then(|v| v.as_str());
+
+    if let Some(ca) = cand_artist {
+        if !lookup.cleaned.core_artist.trim().is_empty()
+            && artist_match_score(&lookup.effective_query, ca) < 0.72
+        {
+            return None;
+        }
+    }
+    if let Some(ct) = cand_title {
+        if title_match_score(&lookup.effective_query, ct) < 0.72 {
+            return None;
+        }
+    }
 
     let mut base_score = 0.85;
     if let (Some(ct), Some(ca)) = (cand_title, cand_artist) {
@@ -1223,6 +1227,11 @@ pub fn parse_lrcmux_or_kpoe_response(
         }
     }
 
+    let fallback_title = cand_title.unwrap_or(&lookup.effective_query.title);
+    let fallback_artist = cand_artist
+        .or_else(|| lookup.effective_query.primary_artist())
+        .unwrap_or("");
+
     // 1. Check for LRC string in `syncedLyrics` or `lrc`
     if let Some(synced_str) = json
         .get("syncedLyrics")
@@ -1231,8 +1240,17 @@ pub fn parse_lrcmux_or_kpoe_response(
         .filter(|s| !s.trim().is_empty())
     {
         let mut parsed = ParsedLrc::parse(synced_str);
+        if !parsed.matches_track_identity(&lookup.effective_query) {
+            return None;
+        }
         let verified = !settings.verify_lyrics || parsed.verify_and_clean();
         if verified && is_valid_synced_lrc(&parsed) {
+            if parsed.metadata.title.is_none() && !fallback_title.is_empty() {
+                parsed.metadata.title = Some(fallback_title.to_string());
+            }
+            if parsed.metadata.artist.is_none() && !fallback_artist.is_empty() {
+                parsed.metadata.artist = Some(fallback_artist.to_string());
+            }
             let eff_dur = estimate_lrc_duration_secs(&parsed, explicit_dur);
             if !is_within_duration_bounds(lookup.target_duration, eff_dur) {
                 return None;
@@ -1252,8 +1270,17 @@ pub fn parse_lrcmux_or_kpoe_response(
 
     // 2. Check for KPOE / LyricsPlus array or `lyrics.lines` array
     if let Some(mut parsed) = parse_kpoe_lyrics_json(json) {
+        if !parsed.matches_track_identity(&lookup.effective_query) {
+            return None;
+        }
         let verified = !settings.verify_lyrics || parsed.verify_and_clean();
         if verified && is_valid_synced_lrc(&parsed) {
+            if parsed.metadata.title.is_none() && !fallback_title.is_empty() {
+                parsed.metadata.title = Some(fallback_title.to_string());
+            }
+            if parsed.metadata.artist.is_none() && !fallback_artist.is_empty() {
+                parsed.metadata.artist = Some(fallback_artist.to_string());
+            }
             let eff_dur = estimate_lrc_duration_secs(&parsed, explicit_dur);
             if !is_within_duration_bounds(lookup.target_duration, eff_dur) {
                 return None;
@@ -1266,16 +1293,6 @@ pub fn parse_lrcmux_or_kpoe_response(
                 plain_lrc: None,
                 duration_secs: eff_dur,
                 matches_playing_length: matches_len,
-                score: base_score,
-            });
-        } else if verified && !parsed.lines.is_empty() {
-            return Some(ProviderCandidate {
-                provider,
-                provider_order,
-                synced_lrc: None,
-                plain_lrc: Some(parsed),
-                duration_secs: explicit_dur,
-                matches_playing_length: false,
                 score: base_score,
             });
         }
@@ -1527,6 +1544,9 @@ pub fn parse_lrclib_candidates(
             .filter(|s| !s.trim().is_empty())
         {
             let mut parsed = ParsedLrc::parse(synced_str);
+            if !parsed.matches_track_identity(query) {
+                continue;
+            }
             let verified = !settings.verify_lyrics || parsed.verify_and_clean();
             if verified && is_valid_synced_lrc(&parsed) {
                 if parsed.metadata.title.is_none() && !cand_title.is_empty() {
@@ -1729,8 +1749,19 @@ fn fetch_kugou_keyword(
         };
         let lrc_text = String::from_utf8_lossy(&decoded_bytes);
         let mut parsed = ParsedLrc::parse(&lrc_text);
+        if !parsed.matches_track_identity(query) {
+            continue;
+        }
         let verified = !settings.verify_lyrics || parsed.verify_and_clean();
         if verified && is_valid_synced_lrc(&parsed) {
+            if parsed.metadata.title.is_none() && !query.title.is_empty() {
+                parsed.metadata.title = Some(query.title.clone());
+            }
+            if parsed.metadata.artist.is_none() {
+                if let Some(ar) = query.primary_artist() {
+                    parsed.metadata.artist = Some(ar.to_string());
+                }
+            }
             let eff_dur = estimate_lrc_duration_secs(&parsed, c_dur_secs);
             let len_matched = is_length_matched(track_length, eff_dur);
             return Some(ProviderCandidate {
@@ -1869,8 +1900,19 @@ fn fetch_netease_keyword(
             continue;
         };
         let mut parsed = ParsedLrc::parse(lrc_str);
+        if !parsed.matches_track_identity(query) {
+            continue;
+        }
         let verified_synced = !settings.verify_lyrics || parsed.verify_and_clean();
         if verified_synced && is_valid_synced_lrc(&parsed) {
+            if parsed.metadata.title.is_none() && !query.title.is_empty() {
+                parsed.metadata.title = Some(query.title.clone());
+            }
+            if parsed.metadata.artist.is_none() {
+                if let Some(ar) = query.primary_artist() {
+                    parsed.metadata.artist = Some(ar.to_string());
+                }
+            }
             let eff_dur = estimate_lrc_duration_secs(&parsed, c_dur_secs);
             let len_matched = is_length_matched(track_length, eff_dur);
             return Some(ProviderCandidate {
@@ -1991,6 +2033,39 @@ mod tests {
         .expect("Should match synced uncensored lyrics");
         let synced = matched.synced_lrc.expect("Should have synced LRC");
         assert!(synced.lines[0].text.contains("fuck them old niggas"));
+
+        // 3. Same song title ("Starlight") by different artists ("Dave" vs "Drake" / "Muse") must be rejected
+        let q_dave = TrackQuery {
+            title: "Starlight".to_string(),
+            artists: vec!["Dave".to_string()],
+            album: None,
+            url: None,
+        };
+        let wrong_artists_payload = json!([
+            {
+                "trackName": "Starlight",
+                "artistName": "Muse",
+                "duration": 211.0,
+                "syncedLyrics": "[00:05.00]Far away\n[00:10.00]This ship has taken me far away\n"
+            },
+            {
+                "trackName": "Starlight",
+                "artistName": "Drake",
+                "duration": 211.0,
+                "syncedLyrics": "[00:05.00]Wrong artist lyrics line 1\n[00:10.00]Wrong artist lyrics line 2\n"
+            }
+        ]);
+        assert!(
+            parse_lrclib_candidates(
+                &wrong_artists_payload,
+                &q_dave,
+                Some(Duration::from_secs(211)),
+                0,
+                &settings,
+            )
+            .is_none(),
+            "Must reject same-title songs by different artists (Muse / Drake when playing Dave)"
+        );
     }
 
     #[test]

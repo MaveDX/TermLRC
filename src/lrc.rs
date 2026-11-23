@@ -132,6 +132,7 @@ impl ParsedLrc {
         let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         let mut metadata = LrcMetadata::default();
         let mut lines = Vec::new();
+        let mut untimed_text_lines = 0usize;
 
         for raw_line in content.lines() {
             let line = raw_line.trim();
@@ -141,7 +142,11 @@ impl ParsedLrc {
 
             let (timestamps, remainder) = extract_line_timestamps(line);
             if timestamps.is_empty() {
-                parse_metadata_tag(line, &mut metadata);
+                if line.starts_with('[') && line.ends_with(']') && line.contains(':') {
+                    parse_metadata_tag(line, &mut metadata);
+                } else {
+                    untimed_text_lines += 1;
+                }
                 continue;
             }
 
@@ -157,11 +162,14 @@ impl ParsedLrc {
 
         lines.sort_by_key(|l| l.timestamp);
 
+        // If untimed plain-text lines outnumber timed lines, this is not a properly synced LRC
+        let is_synced = !lines.is_empty() && untimed_text_lines <= lines.len() / 2;
+
         Self {
             metadata,
             lines,
             source_label: None,
-            is_synced: true,
+            is_synced,
             match_score: 1.0,
         }
     }
@@ -261,9 +269,10 @@ impl ParsedLrc {
     }
 
     /// Atomically write this `ParsedLrc` to a `.lrc` sidecar file on disk.
+    /// Refuses to write unsynced or invalid lyrics so `.lrc` files on disk are always genuinely synced.
     pub fn save_to_file(&self, path: &Path) -> Result<()> {
-        if self.lines.is_empty() {
-            return Ok(());
+        if !self.is_strictly_synced() {
+            anyhow::bail!("Refusing to save unsynced lyrics as an LRC file");
         }
         let content = self.to_lrc_string();
         let tmp_path = path.with_extension("lrc.tmp");
@@ -358,11 +367,54 @@ impl ParsedLrc {
         }
     }
 
-    /// Verify that this `ParsedLrc` contains genuine lyrics rather than Chinese/CJK artist credits,
-    /// production metadata rosters (e.g. `作曲 : ...`, `作词 : ...`), or `"纯音乐，请欣赏"` placeholders.
+    /// Validate that this `ParsedLrc` has real, progressing line timestamps across the song
+    /// (rejecting plain text, single-timestamp dumps, or fake `[00:00.00]`-only files).
+    pub fn is_strictly_synced(&self) -> bool {
+        if !self.is_synced || self.lines.len() < 2 {
+            return false;
+        }
+
+        let mut non_empty_timestamps: Vec<Duration> = self
+            .lines
+            .iter()
+            .filter(|l| !l.text.trim().is_empty())
+            .map(|l| l.timestamp)
+            .collect();
+
+        if non_empty_timestamps.len() < 2 {
+            return false;
+        }
+
+        non_empty_timestamps.sort();
+        let min_ts = non_empty_timestamps[0];
+        let max_ts = *non_empty_timestamps.last().unwrap();
+
+        // Must have timestamps progressing past 00:01.00 and spanning at least 1.5 seconds
+        if max_ts <= Duration::from_millis(1000)
+            || max_ts.saturating_sub(min_ts) < Duration::from_millis(1500)
+        {
+            return false;
+        }
+
+        let total_non_empty = non_empty_timestamps.len();
+        non_empty_timestamps.dedup();
+        let distinct_count = non_empty_timestamps.len();
+
+        // Require at least 2 distinct timestamps, and for longer lyrics at least 40% distinct timestamps
+        // so files where almost every line is stamped with the same dummy timestamp are rejected.
+        if distinct_count < 2 || (total_non_empty >= 6 && distinct_count * 5 < total_non_empty * 2)
+        {
+            return false;
+        }
+
+        true
+    }
+
+    /// Verify that this `ParsedLrc` is genuinely time-synced and contains real lyrics rather than
+    /// unsynced plain text, Chinese/CJK artist credits, production metadata rosters
+    /// (e.g. `作曲 : ...`, `作词 : ...`), or `"纯音乐，请欣赏"` placeholders.
     ///
-    /// Strips credit/metadata-only lines in-place and returns `true` if valid lyrics remain,
-    /// or `false` if the lyric sheet is empty or consists only of non-lyric metadata.
+    /// Strips credit/metadata-only lines in-place and returns `true` only if valid synced lyrics remain.
     pub fn verify_and_clean(&mut self) -> bool {
         for line in &mut self.lines {
             let (_, stripped) = extract_line_timestamps(line.text.trim());
@@ -374,26 +426,35 @@ impl ParsedLrc {
         self.lines
             .retain(|line| !is_credit_or_non_lyric_line(&line.text));
 
-        let non_empty_count = self
-            .lines
-            .iter()
-            .filter(|l| !l.text.trim().is_empty())
-            .count();
-
-        if non_empty_count < 2 {
+        if !self.is_strictly_synced() {
+            self.is_synced = false;
             return false;
         }
 
-        if self.is_synced {
-            let has_positive_ts = self
-                .lines
-                .iter()
-                .any(|l| l.timestamp > Duration::from_millis(100));
-            if !has_positive_ts {
-                self.is_synced = false;
+        true
+    }
+
+    /// Verify that this `ParsedLrc`'s internal `[ti:...]` and `[ar:...]` headers (if present)
+    /// match the playing track's title and artist, preventing a song with the same title
+    /// by a different artist from displaying the wrong lyrics.
+    pub fn matches_track_identity(&self, query: &crate::matcher::TrackQuery) -> bool {
+        if let Some(ref lrc_ti) = self.metadata.title {
+            if !lrc_ti.trim().is_empty() && !query.title.trim().is_empty() {
+                if crate::matcher::title_match_score(query, lrc_ti) < 0.70 {
+                    return false;
+                }
             }
         }
-
+        let cleaned = crate::matcher::clean_video_metadata(query);
+        if !cleaned.core_artist.trim().is_empty() {
+            if let Some(ref lrc_ar) = self.metadata.artist {
+                if !lrc_ar.trim().is_empty() {
+                    if crate::matcher::artist_match_score(query, lrc_ar) < 0.70 {
+                        return false;
+                    }
+                }
+            }
+        }
         true
     }
 }
@@ -890,6 +951,34 @@ mod tests {
         assert!(parsed_valid.verify_and_clean());
         assert_eq!(parsed_valid.lines.len(), 3);
         assert_eq!(parsed_valid.lines[0].text, "Can you feel my heart?");
+
+        // 4. Unsynced plain text (even with [src:LRCLIB] header) must fail is_strictly_synced() and verify_and_clean()
+        let unsynced_lrc = "\
+[src:LRCLIB]
+Call me by your name feel like
+Citizen Kane 2049
+Blade run like Im Justine in
+RAW
+I get Under the Skin and the
+Skin I Live in Im the Thing
+";
+        let mut parsed_unsynced = ParsedLrc::parse(unsynced_lrc);
+        assert!(!parsed_unsynced.is_strictly_synced());
+        assert!(!parsed_unsynced.verify_and_clean());
+
+        let mut plain_unsynced = ParsedLrc::from_plain_text(unsynced_lrc);
+        assert!(!plain_unsynced.is_strictly_synced());
+        assert!(!plain_unsynced.verify_and_clean());
+
+        // 5. Fake synced file where all lines share [00:00.00] must also fail is_strictly_synced()
+        let fake_synced = "\
+[00:00.00] Line one
+[00:00.00] Line two
+[00:00.00] Line three
+";
+        let mut parsed_fake = ParsedLrc::parse(fake_synced);
+        assert!(!parsed_fake.is_strictly_synced());
+        assert!(!parsed_fake.verify_and_clean());
     }
 
     #[test]

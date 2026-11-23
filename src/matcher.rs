@@ -832,7 +832,7 @@ impl LrcMatcher {
         fallback_to_root_dir: bool,
         verify_lyrics: bool,
     ) -> Option<PathBuf> {
-        if lrc.lines.is_empty() || lrc.match_score < save_lrc_threshold {
+        if !lrc.is_strictly_synced() || lrc.match_score < save_lrc_threshold {
             return None;
         }
         let target_path = self
@@ -846,13 +846,16 @@ impl LrcMatcher {
             })?;
         if let Ok(meta) = std::fs::metadata(&target_path) {
             if meta.is_file() && meta.len() > 0 {
-                let existing_is_valid = if verify_lyrics {
-                    ParsedLrc::from_file(&target_path)
-                        .map(|mut p| p.verify_and_clean())
-                        .unwrap_or(false)
-                } else {
-                    true
-                };
+                let existing_is_valid = ParsedLrc::from_file(&target_path)
+                    .map(|mut p| {
+                        p.matches_track_identity(query)
+                            && if verify_lyrics {
+                                p.verify_and_clean()
+                            } else {
+                                p.is_strictly_synced()
+                            }
+                    })
+                    .unwrap_or(false);
                 if existing_is_valid {
                     return Some(target_path);
                 }
@@ -898,30 +901,64 @@ impl LrcMatcher {
 }
 
 fn score_candidate(entry: &IndexedLrc, query: &TrackQuery, url_stem: Option<&str>) -> f64 {
+    let raw_title = query.title.trim();
+    if raw_title.is_empty() {
+        if let Some(u_stem) = url_stem {
+            if !u_stem.is_empty() && entry.norm_stem == u_stem {
+                return 0.99;
+            }
+        }
+        return 0.0;
+    }
+
+    let cleaned_q = clean_video_metadata(query);
+    let has_query_artist = !cleaned_q.core_artist.trim().is_empty();
+
+    // Hard gate 1: If the LRC file has an internal [ti:...] tag, it must match the playing track's title
+    if let Some(ref lrc_ti) = entry.metadata.title {
+        if !lrc_ti.trim().is_empty() && title_match_score(query, lrc_ti) < 0.70 {
+            return 0.0;
+        }
+    }
+
+    // Hard gate 2: If the LRC file has an internal [ar:...] tag and the playing track has an artist,
+    // they must match — never show another artist's lyrics for a song with the same title.
+    let mut has_verified_tag_artist = false;
+    if has_query_artist {
+        if let Some(ref lrc_ar) = entry.metadata.artist {
+            if !lrc_ar.trim().is_empty() {
+                if artist_match_score(query, lrc_ar) < 0.70 {
+                    return 0.0;
+                }
+                has_verified_tag_artist = true;
+            }
+        }
+    }
+
+    // Check if the LRC file lives in the exact same directory as the playing local audio file
+    let in_same_audio_dir = resolve_local_audio_path(query)
+        .and_then(|ap| ap.parent().map(|p| p.to_path_buf()))
+        .and_then(|audio_dir| {
+            entry
+                .path
+                .parent()
+                .map(|lrc_dir| lrc_dir == audio_dir)
+        })
+        .unwrap_or(false);
+
     let mut max_score: f64 = 0.0;
 
-    // 1. Direct URL filename stem match inside the target lyrics folder
+    // 1. Direct URL filename stem match ONLY if in the same directory or artist is not contradicted
     if let Some(u_stem) = url_stem {
-        if !u_stem.is_empty() && entry.norm_stem == u_stem {
+        if !u_stem.is_empty() && entry.norm_stem == u_stem && in_same_audio_dir {
             max_score = max_score.max(0.99);
         }
     }
 
-    let raw_title = query.title.trim();
-    if raw_title.is_empty() {
-        return max_score;
-    }
-
     let norm_title = normalize(raw_title);
-    let clean_title = normalize(&strip_decorations(raw_title));
-    let norm_artist = query
-        .primary_artist()
-        .map(normalize)
-        .unwrap_or_default();
-    let clean_artist = query
-        .primary_artist()
-        .map(|a| normalize(&strip_decorations(a)))
-        .unwrap_or_default();
+    let clean_title = normalize(&cleaned_q.core_title);
+    let norm_artist = normalize(&cleaned_q.artist);
+    let clean_artist = normalize(&cleaned_q.core_artist);
     let norm_album = query
         .album
         .as_deref()
@@ -930,22 +967,14 @@ fn score_candidate(entry: &IndexedLrc, query: &TrackQuery, url_stem: Option<&str
 
     // 2. Check LRC internal metadata tags ([ti:...], [ar:...]) if present
     if let Some(ref lrc_ti) = entry.metadata.title {
-        let norm_lrc_ti = normalize(lrc_ti);
-        let clean_lrc_ti = normalize(&strip_decorations(lrc_ti));
-        let title_sim = similarity(&norm_title, &norm_lrc_ti)
-            .max(similarity(&clean_title, &clean_lrc_ti));
-
-        if title_sim > 0.80 {
-            if !norm_artist.is_empty() {
+        let title_sim = title_match_score(query, lrc_ti);
+        if title_sim >= 0.75 {
+            if has_query_artist {
                 if let Some(ref lrc_ar) = entry.metadata.artist {
-                    let norm_lrc_ar = normalize(lrc_ar);
-                    let ar_sim = similarity(&norm_artist, &norm_lrc_ar)
-                        .max(similarity(&clean_artist, &norm_lrc_ar));
-                    if ar_sim > 0.75 {
-                        max_score = max_score.max(title_sim * 0.7 + ar_sim * 0.3);
+                    let ar_sim = artist_match_score(query, lrc_ar);
+                    if ar_sim >= 0.70 {
+                        max_score = max_score.max(title_sim * 0.65 + ar_sim * 0.35);
                     }
-                } else {
-                    max_score = max_score.max(title_sim * 0.85);
                 }
             } else {
                 max_score = max_score.max(title_sim * 0.90);
@@ -953,90 +982,321 @@ fn score_candidate(entry: &IndexedLrc, query: &TrackQuery, url_stem: Option<&str
         }
     }
 
-    // 3. Check combined "<artist> - <title>" or "<title> - <artist>" against filename stem
-    let stem_without_track = normalize(&strip_leading_track_num(&entry.file_stem));
+    // 3. Split filename (after stripping any leading track number like "01 - ") on ` - `
+    //    to test explicit (artist, title) or (title, artist) parts
+    let raw_stem_without_track = strip_leading_track_num(&entry.file_stem);
+    let mut filename_has_artist_split = false;
+    if let Some((left, right)) = split_artist_title(&raw_stem_without_track) {
+        let left_clean = strip_leading_track_num(left);
+        if !left_clean.is_empty() && !left_clean.chars().all(|c| c.is_ascii_digit()) {
+            filename_has_artist_split = true;
+            let right_title_sim = title_match_score(query, right);
+            let left_artist_sim = if has_query_artist {
+                artist_match_score(query, &left_clean)
+            } else {
+                0.80
+            };
 
-    if !norm_artist.is_empty() {
+            let left_title_sim = title_match_score(query, &left_clean);
+            let right_artist_sim = if has_query_artist {
+                artist_match_score(query, right)
+            } else {
+                0.0
+            };
+
+            if right_title_sim >= 0.72 && left_artist_sim >= 0.70 {
+                max_score = max_score.max(right_title_sim * 0.65 + left_artist_sim * 0.35);
+            } else if left_title_sim >= 0.72 && right_artist_sim >= 0.70 {
+                max_score = max_score.max(left_title_sim * 0.65 + right_artist_sim * 0.35);
+            } else if has_query_artist && (right_title_sim >= 0.72 || left_title_sim >= 0.72) {
+                // Filename explicitly specifies `<Other Artist> - <Same Title>.lrc` -> reject!
+                return 0.0;
+            }
+        }
+    }
+
+    // 4. Check combined "<artist> <title>" or "<title> <artist>" against filename stem
+    let stem_without_track = normalize(&raw_stem_without_track);
+    if has_query_artist && !filename_has_artist_split {
         let artist_title = format!("{} {}", norm_artist, norm_title);
         let clean_artist_title = format!("{} {}", clean_artist, clean_title);
         let title_artist = format!("{} {}", norm_title, norm_artist);
 
-        let combo_sim = similarity(&stem_without_track, &artist_title)
-            .max(similarity(&entry.stripped_stem, &clean_artist_title))
-            .max(similarity(&stem_without_track, &title_artist));
-
-        // Exact normalized match on "artist - title"
-        if stem_without_track == artist_title || entry.stripped_stem == clean_artist_title {
+        if stem_without_track == artist_title
+            || entry.stripped_stem == clean_artist_title
+            || stem_without_track == title_artist
+        {
             max_score = max_score.max(0.98);
-        } else if combo_sim > 0.82 {
-            // Ensure the title portion itself actually matches well
-            if stem_contains_tokens(&entry.stripped_stem, &clean_title) {
+        } else if stem_contains_tokens(&entry.stripped_stem, &clean_artist)
+            && stem_contains_tokens(&entry.stripped_stem, &clean_title)
+        {
+            let combo_sim = similarity(&stem_without_track, &artist_title)
+                .max(similarity(&entry.stripped_stem, &clean_artist_title))
+                .max(similarity(&stem_without_track, &title_artist));
+            if combo_sim >= 0.82 {
                 max_score = max_score.max(combo_sim * 0.95);
+            }
+        }
+    }
+
+    // 5. Check when filename is just the song title (e.g. `Artist/Album/01 - Title.lrc` or `Title.lrc`)
+    let stem_title_sim = title_match_score(query, &strip_leading_track_num(&entry.file_stem));
+    if stem_title_sim >= 0.78 && !filename_has_artist_split {
+        if !has_query_artist {
+            max_score = max_score.max(stem_title_sim * 0.92);
+        } else {
+            // When the playing track has an artist and the filename only has the song title,
+            // require artist confirmation from [ar:...], directory hierarchy, or same audio folder
+            let dir_artist_sim = artist_match_score(query, &entry.parent_dir)
+                .max(artist_match_score(query, &entry.grandparent_dir));
+            let dir_album_sim = if !norm_album.is_empty() {
+                similarity(&entry.parent_dir, &norm_album)
             } else {
-                max_score = max_score.max(combo_sim * 0.80);
+                0.0
+            };
+
+            // If grandparent/parent directory is named after a different artist (and not the album), reject
+            if dir_artist_sim >= 0.70 {
+                let score = (stem_title_sim * 0.84 + 0.14 * dir_artist_sim).min(0.97);
+                max_score = max_score.max(score);
+            } else if has_verified_tag_artist || in_same_audio_dir {
+                max_score = max_score.max(stem_title_sim * 0.92);
+            } else if dir_album_sim >= 0.85 && entry.grandparent_dir.is_empty() {
+                max_score = max_score.max(stem_title_sim * 0.85);
             }
-        }
-    }
-
-    // 4. Check when filename is just the song title (e.g. `Artist/Album/01 - Title.lrc` or `Title.lrc`)
-    let stem_title_sim = similarity(&stem_without_track, &norm_title)
-        .max(similarity(&entry.stripped_stem, &clean_title));
-
-    if stem_title_sim > 0.78 {
-        let mut dir_bonus = 0.0;
-        if !norm_artist.is_empty() {
-            let parent_ar = similarity(&entry.parent_dir, &norm_artist)
-                .max(similarity(&entry.grandparent_dir, &norm_artist));
-            if parent_ar > 0.80 {
-                dir_bonus += 0.12 * parent_ar;
-            }
-        }
-        if !norm_album.is_empty() {
-            let parent_al = similarity(&entry.parent_dir, &norm_album);
-            if parent_al > 0.80 {
-                dir_bonus += 0.06 * parent_al;
-            }
-        }
-
-        // If there is no artist in the filename, scale base title match slightly below a full artist+title match
-        // unless parent folders confirm the artist/album.
-        let base = if norm_artist.is_empty() {
-            stem_title_sim * 0.92
-        } else {
-            stem_title_sim * 0.82
-        };
-        max_score = max_score.max((base + dir_bonus).min(0.97));
-    }
-
-    // 5. Split filename on ` - ` to test explicit (artist, title) parts
-    if let Some((left, right)) = split_artist_title(&entry.file_stem) {
-        let norm_left = normalize(&strip_decorations(left));
-        let norm_right = normalize(&strip_decorations(right));
-
-        let right_title_sim = similarity(&norm_right, &clean_title).max(similarity(&normalize(right), &norm_title));
-        let left_artist_sim = if !clean_artist.is_empty() {
-            similarity(&norm_left, &clean_artist).max(similarity(&normalize(left), &norm_artist))
-        } else {
-            0.8
-        };
-
-        if right_title_sim > 0.75 && left_artist_sim > 0.70 {
-            max_score = max_score.max(right_title_sim * 0.68 + left_artist_sim * 0.32);
-        }
-
-        // Also check reversed `Title - Artist.lrc`
-        let left_title_sim = similarity(&norm_left, &clean_title);
-        let right_artist_sim = if !clean_artist.is_empty() {
-            similarity(&norm_right, &clean_artist)
-        } else {
-            0.0
-        };
-        if left_title_sim > 0.75 && right_artist_sim > 0.75 {
-            max_score = max_score.max(left_title_sim * 0.65 + right_artist_sim * 0.30);
         }
     }
 
     max_score
+}
+
+/// Compute a strict artist match score `[0.0, 1.0]` between the playing `TrackQuery`
+/// and a candidate artist string, preventing two different artists with similar names
+/// (e.g. `"Dave"` vs `"Drake"`, `"Muse"` vs `"Moby"`, `"Three Days Grace"` vs `"Three Doors Down"`)
+/// from matching each other's lyrics.
+pub fn artist_match_score(query: &TrackQuery, cand_artist: &str) -> f64 {
+    let q_artists = collect_query_artists(query);
+    let c_artists = split_artist_entities(cand_artist);
+    if q_artists.is_empty() || c_artists.is_empty() {
+        return 0.0;
+    }
+
+    let mut best = 0.0f64;
+    for (q_idx, qa) in q_artists.iter().enumerate() {
+        for (c_idx, ca) in c_artists.iter().enumerate() {
+            let sim = strict_entity_similarity(qa, ca);
+            let weight = if q_idx == 0 && c_idx == 0 {
+                1.0
+            } else {
+                0.94
+            };
+            best = best.max(sim * weight);
+        }
+    }
+    best
+}
+
+/// Compute a strict song title match score `[0.0, 1.0]` between the playing `TrackQuery`
+/// and a candidate title string.
+pub fn title_match_score(query: &TrackQuery, cand_title: &str) -> f64 {
+    let q_clean = clean_video_metadata(query);
+    let c_stripped = strip_featuring_and_decorations(&strip_video_tags(cand_title));
+
+    let q_core = normalize(&q_clean.core_title);
+    let q_full = normalize(&q_clean.title);
+    let c_core = normalize(&c_stripped);
+    let c_full = normalize(cand_title);
+
+    if (q_core.is_empty() && q_full.is_empty()) || (c_core.is_empty() && c_full.is_empty()) {
+        return 0.0;
+    }
+
+    let s1 = strict_title_similarity(&q_core, &c_core);
+    let s2 = strict_title_similarity(&q_full, &c_full);
+    let s3 = strict_title_similarity(&q_core, &c_full) * 0.96;
+    s1.max(s2).max(s3)
+}
+
+fn collect_query_artists(query: &TrackQuery) -> Vec<String> {
+    let mut out = Vec::new();
+    let cleaned = clean_video_metadata(query);
+    for raw in [&cleaned.core_artist, &cleaned.artist] {
+        for ent in split_artist_entities(raw) {
+            if !ent.is_empty() && !out.contains(&ent) {
+                out.push(ent);
+            }
+        }
+    }
+    for ar in &query.artists {
+        if Some(ar.as_str()) == cleaned.uploader_channel.as_deref() {
+            continue;
+        }
+        for ent in split_artist_entities(ar) {
+            if !ent.is_empty() && !out.contains(&ent) {
+                out.push(ent);
+            }
+        }
+    }
+    out
+}
+
+fn split_artist_entities(raw: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let cleaned = clean_channel_suffix(&strip_decorations(raw));
+    let full_norm = strip_leading_the(&normalize(&cleaned));
+    if !full_norm.is_empty() {
+        out.push(full_norm);
+    }
+
+    let mut working = cleaned.to_lowercase();
+    for sep in [
+        " feat. ", " feat ", " ft. ", " ft ", " with ", " vs. ", " vs ", " x ", " × ",
+    ] {
+        working = working.replace(sep, ",");
+    }
+    for part in working.split([',', '&', '/', ';', '、']) {
+        let n = strip_leading_the(&normalize(part));
+        if !n.is_empty() && !out.contains(&n) {
+            out.push(n);
+        }
+    }
+    out
+}
+
+fn strip_leading_the(norm: &str) -> String {
+    norm.strip_prefix("the ")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(norm)
+        .to_string()
+}
+
+fn strict_entity_similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    // Check compact form without spaces (e.g. "jay z" vs "jayz")
+    let a_compact: String = a.chars().filter(|c| !c.is_whitespace()).collect();
+    let b_compact: String = b.chars().filter(|c| !c.is_whitespace()).collect();
+    if !a_compact.is_empty() && a_compact == b_compact {
+        return 0.98;
+    }
+
+    let a_tokens: Vec<&str> = a.split_whitespace().collect();
+    let b_tokens: Vec<&str> = b.split_whitespace().collect();
+
+    if a_tokens.len() == 1 && b_tokens.len() == 1 {
+        return single_word_strict_similarity(a_tokens[0], b_tokens[0]);
+    }
+
+    // Multi-word artist comparison: require high token overlap
+    let mut matched_a = 0usize;
+    for &at in &a_tokens {
+        if b_tokens
+            .iter()
+            .any(|&bt| single_word_strict_similarity(at, bt) >= 0.82)
+        {
+            matched_a += 1;
+        }
+    }
+    let mut matched_b = 0usize;
+    for &bt in &b_tokens {
+        if a_tokens
+            .iter()
+            .any(|&at| single_word_strict_similarity(at, bt) >= 0.82)
+        {
+            matched_b += 1;
+        }
+    }
+
+    let recall_a = matched_a as f64 / a_tokens.len() as f64;
+    let recall_b = matched_b as f64 / b_tokens.len() as f64;
+    let token_f1 = if recall_a + recall_b > 0.0 {
+        2.0 * recall_a * recall_b / (recall_a + recall_b)
+    } else {
+        0.0
+    };
+
+    if token_f1 < 0.66 {
+        return 0.0;
+    }
+    (token_f1 * 0.75 + similarity(a, b) * 0.25).clamp(0.0, 1.0)
+}
+
+fn strict_title_similarity(a: &str, b: &str) -> f64 {
+    if a.is_empty() || b.is_empty() {
+        return 0.0;
+    }
+    if a == b {
+        return 1.0;
+    }
+    // Purely numeric titles (e.g. "200" vs "2000" or "1999") must match digits exactly
+    if a.chars().all(|c| c.is_ascii_digit()) || b.chars().all(|c| c.is_ascii_digit()) {
+        return if a == b { 1.0 } else { 0.0 };
+    }
+
+    let a_tokens: Vec<&str> = a.split_whitespace().collect();
+    let b_tokens: Vec<&str> = b.split_whitespace().collect();
+
+    if a_tokens.len() == 1 && b_tokens.len() == 1 {
+        return single_word_strict_similarity(a_tokens[0], b_tokens[0]);
+    }
+
+    let mut matched_a = 0usize;
+    for &at in &a_tokens {
+        if b_tokens
+            .iter()
+            .any(|&bt| single_word_strict_similarity(at, bt) >= 0.80)
+        {
+            matched_a += 1;
+        }
+    }
+    let mut matched_b = 0usize;
+    for &bt in &b_tokens {
+        if a_tokens
+            .iter()
+            .any(|&at| single_word_strict_similarity(at, bt) >= 0.80)
+        {
+            matched_b += 1;
+        }
+    }
+
+    let recall_a = matched_a as f64 / a_tokens.len() as f64;
+    let recall_b = matched_b as f64 / b_tokens.len() as f64;
+    let token_f1 = if recall_a + recall_b > 0.0 {
+        2.0 * recall_a * recall_b / (recall_a + recall_b)
+    } else {
+        0.0
+    };
+
+    if token_f1 < 0.60 {
+        return 0.0;
+    }
+    (token_f1 * 0.65 + similarity(a, b) * 0.35).clamp(0.0, 1.0)
+}
+
+fn single_word_strict_similarity(a: &str, b: &str) -> f64 {
+    if a == b {
+        return 1.0;
+    }
+    let len_a = a.chars().count();
+    let len_b = b.chars().count();
+    let max_len = len_a.max(len_b);
+    let min_len = len_a.min(len_b);
+    if min_len == 0 || max_len.saturating_sub(min_len) > 2 {
+        return 0.0;
+    }
+    let dist = strsim::levenshtein(a, b);
+    if max_len >= 5 && dist == 1 {
+        0.88
+    } else if max_len >= 8 && dist == 2 {
+        0.80
+    } else {
+        0.0
+    }
 }
 
 /// Normalize a string: lowercase, alphanumeric tokens separated by single spaces.
@@ -1363,6 +1623,98 @@ mod tests {
         assert!(!bl_matcher.is_track_blacklisted(&q_save));
 
         let _ = fs::remove_dir_all(&sidecar_dir);
+    }
+
+    #[test]
+    fn test_same_title_different_artists_never_cross_match() {
+        let temp_dir =
+            std::env::temp_dir().join(format!("termlrc_same_title_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&temp_dir);
+        let dir_muse = temp_dir.join("Muse/Black Holes and Revelations");
+        let dir_dave = temp_dir.join("Dave");
+        fs::create_dir_all(&dir_muse).unwrap();
+        fs::create_dir_all(&dir_dave).unwrap();
+
+        // Muse has "01 - Starlight.lrc" in Muse folder, and "Muse - Starlight.lrc" in root
+        let lrc_muse_folder = dir_muse.join("01 - Starlight.lrc");
+        fs::write(
+            &lrc_muse_folder,
+            "[ti:Starlight]\n[ar:Muse]\n[00:05.00]Far away\n[00:10.00]This ship has taken me far away\n",
+        )
+        .unwrap();
+
+        let lrc_tdg = temp_dir.join("Three Days Grace - Home.lrc");
+        fs::write(
+            &lrc_tdg,
+            "[ti:Home]\n[ar:Three Days Grace]\n[00:12.00]This house is not a home\n[00:16.00]I'd rather be painful\n",
+        )
+        .unwrap();
+
+        let mut matcher = LrcMatcher::new(temp_dir.clone(), 0.62);
+
+        // 1. Playing "Starlight" by Dave (even with a local file URL "01 - Starlight.flac" in Dave's folder!)
+        // must NEVER match Muse's "01 - Starlight.lrc"
+        let q_dave = TrackQuery {
+            title: "Starlight".to_string(),
+            artists: vec!["Dave".to_string()],
+            album: None,
+            url: Some(format!(
+                "file://{}",
+                dir_dave.join("01 - Starlight.flac").display()
+            )),
+        };
+        assert!(
+            matcher.find_best_match(&q_dave).is_none(),
+            "Dave - Starlight must not match Muse - Starlight"
+        );
+
+        // 2. Playing "Starlight" by Drake (similar 1-word name starting with D) must also not match Muse or Dave
+        let q_drake = TrackQuery {
+            title: "Starlight".to_string(),
+            artists: vec!["Drake".to_string()],
+            album: None,
+            url: None,
+        };
+        assert!(matcher.find_best_match(&q_drake).is_none());
+        assert_eq!(artist_match_score(&q_dave, "Drake"), 0.0);
+
+        // 3. Playing "Home" by Three Doors Down must NEVER match "Three Days Grace - Home.lrc"
+        let q_tdd = TrackQuery {
+            title: "Home".to_string(),
+            artists: vec!["Three Doors Down".to_string()],
+            album: None,
+            url: None,
+        };
+        assert!(
+            matcher.find_best_match(&q_tdd).is_none(),
+            "Three Doors Down - Home must not match Three Days Grace - Home"
+        );
+
+        // 4. Playing "Starlight" by Muse DOES match Muse's LRC
+        let q_muse = TrackQuery {
+            title: "Starlight".to_string(),
+            artists: vec!["Muse".to_string()],
+            album: None,
+            url: None,
+        };
+        assert_eq!(
+            matcher.find_best_match(&q_muse).map(|m| m.path),
+            Some(lrc_muse_folder)
+        );
+
+        // 5. Playing "Home" by Three Days Grace DOES match Three Days Grace's LRC
+        let q_tdg = TrackQuery {
+            title: "Home".to_string(),
+            artists: vec!["Three Days Grace".to_string()],
+            album: None,
+            url: None,
+        };
+        assert_eq!(
+            matcher.find_best_match(&q_tdg).map(|m| m.path),
+            Some(lrc_tdg)
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
 

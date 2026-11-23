@@ -24,9 +24,7 @@ use kitty::KittyRenderer;
 use lrc::{LyricSyncState, ParsedLrc};
 use matcher::{find_sibling_lrc, LrcMatcher, TrackQuery};
 use player::MprisTracker;
-use providers::{
-    is_valid_synced_lrc, retry_backoff_duration, FallbackEvent, FallbackWorker, LookupStatus,
-};
+use providers::{retry_backoff_duration, FallbackEvent, FallbackWorker, LookupStatus};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     fs,
@@ -114,15 +112,17 @@ impl App {
         // 1. Direct sibling `.lrc` file next to the local audio file
         if let Some(sibling_path) = find_sibling_lrc(&self.current_query) {
             if let Ok(mut parsed) = ParsedLrc::from_file(&sibling_path) {
-                let is_valid = if verify_lyrics {
-                    parsed.verify_and_clean()
-                } else {
-                    !parsed.lines.is_empty()
-                };
+                let identity_ok = parsed.matches_track_identity(&self.current_query);
+                let is_valid = identity_ok
+                    && if verify_lyrics {
+                        parsed.verify_and_clean()
+                    } else {
+                        parsed.is_strictly_synced()
+                    };
                 if is_valid {
                     self.set_local_lrc(sibling_path, parsed);
                     return LocalLoadOutcome::Loaded;
-                } else if verify_lyrics {
+                } else {
                     saw_failed_verification = true;
                     if rescan_failed {
                         let _ = fs::remove_file(&sibling_path);
@@ -134,15 +134,17 @@ impl App {
         // 2. Recursive `lyrics_dir` search
         if let Some(m) = self.matcher.find_best_match(&self.current_query) {
             if let Ok(mut parsed) = ParsedLrc::from_file(&m.path) {
-                let is_valid = if verify_lyrics {
-                    parsed.verify_and_clean()
-                } else {
-                    is_valid_synced_lrc(&parsed) || !parsed.lines.is_empty()
-                };
+                let identity_ok = parsed.matches_track_identity(&self.current_query);
+                let is_valid = identity_ok
+                    && if verify_lyrics {
+                        parsed.verify_and_clean()
+                    } else {
+                        parsed.is_strictly_synced()
+                    };
                 if is_valid {
                     self.set_local_lrc(m.path, parsed);
                     return LocalLoadOutcome::Loaded;
-                } else if verify_lyrics {
+                } else {
                     saw_failed_verification = true;
                     if rescan_failed {
                         let _ = fs::remove_file(&m.path);
@@ -252,7 +254,7 @@ impl App {
                         let valid = if verify_lyrics {
                             parsed.verify_and_clean()
                         } else {
-                            !parsed.lines.is_empty()
+                            parsed.is_strictly_synced()
                         };
                         if valid {
                             self.set_local_lrc(path.clone(), parsed);
