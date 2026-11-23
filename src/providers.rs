@@ -2,7 +2,7 @@ use crate::config::{data_cache_file_path, FallbackProviderKind, Settings};
 use crate::lrc::{LrcMetadata, LyricLine, ParsedLrc, TimedSegment};
 use crate::matcher::{
     artist_match_score, clean_video_metadata, normalize, title_match_score, CleanedTrackMetadata,
-    TrackQuery,
+    SmartMediaType, TrackQuery,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -40,6 +40,7 @@ pub enum LookupStatus {
     RateLimited,
     NotFound,
     Disabled,
+    SmartMedia(SmartMediaType),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -280,6 +281,7 @@ pub enum FallbackEvent {
         query: TrackQuery,
         lrc: Option<ParsedLrc>,
         rate_limited: bool,
+        detected_instrumental: bool,
     },
 }
 
@@ -308,7 +310,7 @@ impl FallbackWorker {
                     status: LookupStatus::Searching,
                 });
 
-                let (lrc, rate_limited) = fetch_from_fallback_chain(
+                let (lrc, rate_limited, detected_instrumental) = fetch_from_fallback_chain(
                     &req.query,
                     req.track_length,
                     &req.settings,
@@ -320,6 +322,7 @@ impl FallbackWorker {
                     query: req.query,
                     lrc,
                     rate_limited,
+                    detected_instrumental,
                 });
             }
         });
@@ -362,6 +365,7 @@ pub struct ProviderCandidate {
     pub duration_secs: Option<f64>,
     pub matches_playing_length: bool,
     pub score: f64,
+    pub is_instrumental: bool,
 }
 
 impl ProviderCandidate {
@@ -380,6 +384,7 @@ pub struct LookupMetadata {
 
 /// Compute the exponential retry delay after `attempt` failed lookups (0-indexed):
 /// 30s -> 60s -> 120s -> 240s -> 480s -> capped at 600s (10 minutes).
+#[cfg(test)]
 pub fn retry_backoff_duration(attempt: u32) -> Duration {
     let shift = attempt.min(5);
     let secs = (30u64.saturating_mul(1u64 << shift)).min(600);
@@ -435,9 +440,9 @@ fn fetch_from_fallback_chain(
     bypass_cache: bool,
     caches: &mut ProviderCaches,
     event_tx: &Sender<FallbackEvent>,
-) -> (Option<ParsedLrc>, bool) {
+) -> (Option<ParsedLrc>, bool, bool) {
     if raw_query.title.trim().is_empty() {
-        return (None, false);
+        return (None, false, false);
     }
 
     let cache_key = build_query_cache_key(raw_query, settings);
@@ -446,7 +451,7 @@ fn fetch_from_fallback_chain(
     } else if let Some(cached) =
         caches.get_cached_lyrics(&cache_key, raw_query, settings.verify_lyrics)
     {
-        return (Some(cached), false);
+        return (Some(cached), false, false);
     } else {
         caches.remove_cached_lyrics(&cache_key);
     }
@@ -454,12 +459,13 @@ fn fetch_from_fallback_chain(
     let lookup = prepare_lookup_metadata(raw_query, track_length, settings, caches);
     let enabled = settings.enabled_fallback_providers();
     if enabled.is_empty() {
-        return (None, false);
+        return (None, false, false);
     }
 
     let mut candidates: Vec<ProviderCandidate> = Vec::new();
     let mut have_length_matched_synced = false;
     let mut any_rate_limited = false;
+    let mut detected_instrumental = false;
 
     for (order_idx, provider) in enabled.iter().copied().enumerate() {
         // KuGou and NetEase Cloud Music are queried ONLY when none of the earlier providers
@@ -496,25 +502,30 @@ fn fetch_from_fallback_chain(
         }
 
         if let Some(c) = cand {
-            if c.has_synced() && c.matches_playing_length {
-                have_length_matched_synced = true;
+            if c.is_instrumental {
+                detected_instrumental = true;
             }
-            let step_prog = ((candidates.len() as f32 + 1.0) / 2.0).clamp(0.35, 0.85);
-            let _ = event_tx.send(FallbackEvent::Status {
-                query: raw_query.clone(),
-                status: LookupStatus::Downloading {
-                    progress: step_prog,
-                },
-            });
-            candidates.push(c);
+            if c.has_synced() {
+                if c.matches_playing_length {
+                    have_length_matched_synced = true;
+                }
+                let step_prog = ((candidates.len() as f32 + 1.0) / 2.0).clamp(0.35, 0.85);
+                let _ = event_tx.send(FallbackEvent::Status {
+                    query: raw_query.clone(),
+                    status: LookupStatus::Downloading {
+                        progress: step_prog,
+                    },
+                });
+                candidates.push(c);
+            }
         }
     }
 
     let Some(chosen) = select_best_candidate(candidates) else {
-        return (None, any_rate_limited);
+        return (None, any_rate_limited, detected_instrumental);
     };
     if chosen.lines.is_empty() {
-        return (None, any_rate_limited);
+        return (None, any_rate_limited, detected_instrumental);
     }
 
     // Emit final downloading progress steps so the user sees the download progress bar fill
@@ -527,7 +538,7 @@ fn fetch_from_fallback_chain(
     }
 
     caches.insert_cached_lyrics(cache_key, chosen.clone());
-    (Some(chosen), false)
+    (Some(chosen), false, false)
 }
 
 /// Select the winning `ParsedLrc` from the collected provider candidates:
@@ -655,6 +666,8 @@ fn prepare_lookup_metadata(
         },
         album: cleaned.album.clone(),
         url: raw_query.url.clone(),
+        genres: raw_query.genres.clone(),
+        comments: raw_query.comments.clone(),
     };
     let mut target_duration = track_length;
 
@@ -698,6 +711,7 @@ fn identify_recording_deezer_or_musicbrainz(
         },
         album: cleaned.album.clone(),
         url: None,
+        ..Default::default()
     };
 
     // 1. Try Deezer Search API first
@@ -1264,6 +1278,7 @@ pub fn parse_lrcmux_or_kpoe_response(
                 duration_secs: eff_dur,
                 matches_playing_length: matches_len,
                 score: base_score,
+                is_instrumental: false,
             });
         }
     }
@@ -1294,30 +1309,23 @@ pub fn parse_lrcmux_or_kpoe_response(
                 duration_secs: eff_dur,
                 matches_playing_length: matches_len,
                 score: base_score,
+                is_instrumental: false,
             });
         }
     }
 
-    // 3. Check for `plainLyrics` fallback string
-    if let Some(plain_str) = json
-        .get("plainLyrics")
-        .or_else(|| json.get("lyrics").filter(|v| v.is_string()))
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.trim().is_empty())
-    {
-        let mut plain = ParsedLrc::from_plain_text(plain_str);
-        let verified = !settings.verify_lyrics || plain.verify_and_clean();
-        if verified && !plain.lines.is_empty() {
-            return Some(ProviderCandidate {
-                provider,
-                provider_order,
-                synced_lrc: None,
-                plain_lrc: Some(plain),
-                duration_secs: explicit_dur,
-                matches_playing_length: false,
-                score: base_score,
-            });
-        }
+    // 3. Check if provider explicitly flagged this matched recording as instrumental
+    if json.get("instrumental").and_then(|v| v.as_bool()) == Some(true) {
+        return Some(ProviderCandidate {
+            provider,
+            provider_order,
+            synced_lrc: None,
+            plain_lrc: None,
+            duration_secs: explicit_dur,
+            matches_playing_length: false,
+            score: base_score,
+            is_instrumental: true,
+        });
     }
 
     None
@@ -1447,6 +1455,7 @@ fn fetch_lrclib_with_retry(
             },
             album: None,
             url: None,
+            ..Default::default()
         };
         return fetch_lrclib_single(
             &stripped_query,
@@ -1507,7 +1516,8 @@ pub fn parse_lrclib_candidates(
 ) -> Option<ProviderCandidate> {
     let items = json.as_array()?;
     let mut best_synced: Option<(f64, ParsedLrc, Option<f64>, bool)> = None;
-    let mut best_plain: Option<(f64, ParsedLrc, Option<f64>)> = None;
+    let mut saw_matched_instrumental = false;
+    let mut best_inst_score = 0.0f64;
 
     for item in items {
         let cand_title = item
@@ -1536,6 +1546,11 @@ pub fn parse_lrclib_candidates(
         );
         if base_score < settings.fallback_match_threshold {
             continue;
+        }
+
+        if item.get("instrumental").and_then(|v| v.as_bool()) == Some(true) {
+            saw_matched_instrumental = true;
+            best_inst_score = best_inst_score.max(base_score);
         }
 
         if let Some(synced_str) = item
@@ -1576,20 +1591,6 @@ pub fn parse_lrclib_candidates(
                 continue;
             }
         }
-
-        if let Some(plain_str) = item
-            .get("plainLyrics")
-            .and_then(|v| v.as_str())
-            .filter(|s| !s.trim().is_empty())
-        {
-            let mut plain = ParsedLrc::from_plain_text(plain_str);
-            let verified = !settings.verify_lyrics || plain.verify_and_clean();
-            if verified && !plain.lines.is_empty() {
-                if best_plain.as_ref().map_or(true, |(prev_s, ..)| base_score > *prev_s) {
-                    best_plain = Some((base_score, plain, cand_dur));
-                }
-            }
-        }
     }
 
     if let Some((score, lrc, dur, len_matched)) = best_synced {
@@ -1597,22 +1598,24 @@ pub fn parse_lrclib_candidates(
             provider: FallbackProviderKind::LrcLib,
             provider_order,
             synced_lrc: Some(lrc),
-            plain_lrc: best_plain.map(|(_, p, _)| p),
+            plain_lrc: None,
             duration_secs: dur,
             matches_playing_length: len_matched,
             score,
+            is_instrumental: false,
         });
     }
 
-    if let Some((score, plain, dur)) = best_plain {
+    if saw_matched_instrumental {
         return Some(ProviderCandidate {
             provider: FallbackProviderKind::LrcLib,
             provider_order,
             synced_lrc: None,
-            plain_lrc: Some(plain),
-            duration_secs: dur,
+            plain_lrc: None,
+            duration_secs: None,
             matches_playing_length: false,
-            score,
+            score: best_inst_score,
+            is_instrumental: true,
         });
     }
 
@@ -1654,6 +1657,7 @@ fn fetch_kugou_with_retry(
             artists: vec![lookup.cleaned.core_artist.clone()],
             album: None,
             url: None,
+            ..Default::default()
         };
         return fetch_kugou_keyword(
             &stripped_kw,
@@ -1772,6 +1776,18 @@ fn fetch_kugou_keyword(
                 duration_secs: eff_dur,
                 matches_playing_length: len_matched,
                 score,
+                is_instrumental: false,
+            });
+        } else if lrc_text.contains("纯音乐") {
+            return Some(ProviderCandidate {
+                provider: FallbackProviderKind::KuGou,
+                provider_order,
+                synced_lrc: None,
+                plain_lrc: None,
+                duration_secs: c_dur_secs,
+                matches_playing_length: false,
+                score,
+                is_instrumental: true,
             });
         }
     }
@@ -1814,6 +1830,7 @@ fn fetch_netease_with_retry(
             artists: vec![lookup.cleaned.core_artist.clone()],
             album: None,
             url: None,
+            ..Default::default()
         };
         return fetch_netease_keyword(
             &stripped_kw,
@@ -1892,11 +1909,25 @@ fn fetch_netease_keyword(
         else {
             continue;
         };
+        let is_netease_nolyric =
+            lrc_json.get("nolyric").and_then(|v| v.as_bool()) == Some(true);
         let Some(lrc_str) = lrc_json
             .pointer("/lrc/lyric")
             .and_then(|v| v.as_str())
             .filter(|s| !s.trim().is_empty())
         else {
+            if is_netease_nolyric {
+                return Some(ProviderCandidate {
+                    provider: FallbackProviderKind::NetEase,
+                    provider_order,
+                    synced_lrc: None,
+                    plain_lrc: None,
+                    duration_secs: c_dur_secs,
+                    matches_playing_length: false,
+                    score,
+                    is_instrumental: true,
+                });
+            }
             continue;
         };
         let mut parsed = ParsedLrc::parse(lrc_str);
@@ -1923,21 +1954,19 @@ fn fetch_netease_keyword(
                 duration_secs: eff_dur,
                 matches_playing_length: len_matched,
                 score,
+                is_instrumental: false,
             });
-        } else {
-            let mut plain = ParsedLrc::from_plain_text(lrc_str);
-            let verified_plain = !settings.verify_lyrics || plain.verify_and_clean();
-            if verified_plain && !plain.lines.is_empty() {
-                return Some(ProviderCandidate {
-                    provider: FallbackProviderKind::NetEase,
-                    provider_order,
-                    synced_lrc: None,
-                    plain_lrc: Some(plain),
-                    duration_secs: c_dur_secs,
-                    matches_playing_length: false,
-                    score,
-                });
-            }
+        } else if is_netease_nolyric || lrc_str.contains("纯音乐") {
+            return Some(ProviderCandidate {
+                provider: FallbackProviderKind::NetEase,
+                provider_order,
+                synced_lrc: None,
+                plain_lrc: None,
+                duration_secs: c_dur_secs,
+                matches_playing_length: false,
+                score,
+                is_instrumental: true,
+            });
         }
     }
 
@@ -1985,6 +2014,7 @@ mod tests {
             artists: vec!["Future".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
 
         // 1. Candidate > 30s longer than playing track (150s vs 200s = 50s diff) must be rejected
@@ -2040,6 +2070,7 @@ mod tests {
             artists: vec!["Dave".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         let wrong_artists_payload = json!([
             {

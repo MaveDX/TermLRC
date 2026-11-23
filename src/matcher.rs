@@ -1,7 +1,48 @@
 use crate::lrc::{LrcMetadata, ParsedLrc};
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use walkdir::WalkDir;
+
+/// Media category automatically detected by Smart Identification via embedded file metadata,
+/// MPRIS metadata, remote provider flags, or directory/playlist folder names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SmartMediaType {
+    Instrumental,
+    LoFi,
+    Podcast,
+    Audiobook,
+    Soundtrack,
+    Ambient,
+    DjMix,
+}
+
+impl SmartMediaType {
+    pub fn status_label(self) -> &'static str {
+        match self {
+            Self::Instrumental => "Instrumental",
+            Self::LoFi => "Lo-Fi",
+            Self::Podcast => "Podcast",
+            Self::Audiobook => "Audiobook",
+            Self::Soundtrack => "Soundtrack",
+            Self::Ambient => "Ambient",
+            Self::DjMix => "DJ Mix",
+        }
+    }
+
+    pub fn tag_code(self) -> u8 {
+        match self {
+            Self::Instrumental => 10,
+            Self::LoFi => 11,
+            Self::Podcast => 12,
+            Self::Audiobook => 13,
+            Self::Soundtrack => 14,
+            Self::Ambient => 15,
+            Self::DjMix => 16,
+        }
+    }
+}
 
 /// Song information retrieved from MPRIS used to locate the matching LRC file.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -10,6 +51,8 @@ pub struct TrackQuery {
     pub artists: Vec<String>,
     pub album: Option<String>,
     pub url: Option<String>,
+    pub genres: Vec<String>,
+    pub comments: Vec<String>,
 }
 
 impl TrackQuery {
@@ -666,6 +709,20 @@ impl LrcMatcher {
         self.search_indexed(query)
     }
 
+    /// Search already-indexed LRC files without triggering a recursive filesystem rescan.
+    pub fn find_best_match_no_rescan(&self, query: &TrackQuery) -> Option<MatchResult> {
+        if query.is_empty() {
+            return None;
+        }
+        if let Some(sibling) = find_sibling_lrc(query) {
+            return Some(MatchResult {
+                path: sibling,
+                score: 1.0,
+            });
+        }
+        self.search_indexed(query)
+    }
+
     fn search_indexed(&self, query: &TrackQuery) -> Option<MatchResult> {
         // 1. Check if xesam:url points to a local file whose stem matches an LRC file
         let url_stem = query
@@ -898,6 +955,535 @@ impl LrcMatcher {
 
         Some(target_path)
     }
+
+    /// Smart Identification: automatically detect whether the playing track is instrumental
+    /// or non-vocal media (such as `"Instrumental"`, `"Lo-Fi"`, `"Podcast"`, `"Audiobook"`,
+    /// `"Soundtrack"`, `"Ambient"`, `"DJ Mix"`).
+    ///
+    /// Priority order (most specific/reliable first):
+    /// 1. Embedded audio file metadata tags (FLAC/OGG/OPUS Vorbis comments, MP3 ID3v2/ID3v1 tags, M4A atoms).
+    /// 2. MPRIS D-Bus metadata (`xesam:genre`, `xesam:comment`, `xesam:title`, `xesam:album`).
+    /// 3. Directory / playlist folder hierarchy names (e.g. `"Lo-Fi"`, `"Podcasts"`, `"Instrumental"`),
+    ///    while ambiguous or generic directory names return `None` so lyrics are searched normally.
+    pub fn smart_identify_track(&self, query: &TrackQuery) -> Option<SmartMediaType> {
+        if query.is_empty() {
+            return None;
+        }
+
+        let audio_path = resolve_local_audio_path(query)
+            .or_else(|| self.find_matching_local_audio_file(query));
+
+        // 1. Embedded audio file metadata tags (most reliable per-file signal)
+        if let Some(ref path) = audio_path {
+            if let Some(media_type) = inspect_audio_file_smart_media(path) {
+                return Some(media_type);
+            }
+        }
+
+        // 2. MPRIS genre and comment metadata
+        for g in &query.genres {
+            if let Some(media_type) = classify_media_metadata_tag(g) {
+                return Some(media_type);
+            }
+        }
+        for c in &query.comments {
+            if let Some(media_type) = classify_media_metadata_tag(c) {
+                return Some(media_type);
+            }
+        }
+
+        // 3. Explicit markers in track title or album name (e.g. "(Instrumental)", "(Off Vocal)", "Podcast")
+        if let Some(media_type) = classify_title_or_album_markers(&query.title, query.album.as_deref()) {
+            return Some(media_type);
+        }
+
+        // 4. Directory / playlist folder names from the audio file's path
+        if let Some(ref path) = audio_path {
+            if let Some(media_type) = classify_path_directories(path, Some(&self.root_dir)) {
+                return Some(media_type);
+            }
+        } else if let Some(ref raw_url) = query.url {
+            let decoded = urlencoding::decode(raw_url)
+                .map(|c| c.into_owned())
+                .unwrap_or_else(|_| raw_url.clone());
+            let clean = decoded.strip_prefix("file://").unwrap_or(&decoded);
+            if let Some(media_type) = classify_path_directories(Path::new(clean), Some(&self.root_dir)) {
+                return Some(media_type);
+            }
+        }
+
+        None
+    }
+
+    fn find_matching_local_audio_file(&self, query: &TrackQuery) -> Option<PathBuf> {
+        let sidecar = self.resolve_sidecar_lrc_target(query, self.match_threshold)?;
+        let parent = sidecar.parent()?;
+        let stem = sidecar.file_stem()?.to_str()?;
+        const AUDIO_EXTENSIONS: &[&str] = &[
+            "flac", "mp3", "m4a", "ogg", "opus", "wav", "aac", "wv", "ape", "alac", "aiff", "dsf",
+        ];
+        for ext in AUDIO_EXTENSIONS {
+            let candidate = parent.join(format!("{}.{}", stem, ext));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        None
+    }
+}
+
+/// Inspect embedded audio file tags (FLAC/OGG/OPUS Vorbis comments, MP3 ID3v2/ID3v1, M4A atoms)
+/// to determine if the file's metadata identifies it as instrumental or non-vocal media.
+pub fn inspect_audio_file_smart_media(path: &Path) -> Option<SmartMediaType> {
+    if !path.is_file() {
+        return None;
+    }
+    let mut file = File::open(path).ok()?;
+    let mut header_buf = vec![0u8; 65536];
+    let n = file.read(&mut header_buf).ok()?;
+    header_buf.truncate(n);
+
+    // 1. Check Vorbis comment key=value strings (FLAC, OGG, OPUS)
+    for tag_key in [
+        "INSTRUMENTAL=",
+        "PODCAST=",
+        "GENRE=",
+        "GROUPING=",
+        "CONTENTGROUP=",
+        "SUBTITLE=",
+        "COMMENT=",
+        "DESCRIPTION=",
+        "MOOD=",
+        "STYLE=",
+    ] {
+        for val in extract_ascii_key_values(&header_buf, tag_key) {
+            if tag_key == "INSTRUMENTAL=" {
+                let v = val.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "1" | "true" | "yes" | "y") {
+                    return Some(SmartMediaType::Instrumental);
+                }
+            } else if tag_key == "PODCAST=" {
+                let v = val.trim().to_ascii_lowercase();
+                if matches!(v.as_str(), "1" | "true" | "yes" | "y") {
+                    return Some(SmartMediaType::Podcast);
+                }
+            } else if let Some(media) = classify_media_metadata_tag(&val) {
+                return Some(media);
+            }
+        }
+    }
+
+    // 2. Check ID3v2 frames (MP3 / FLAC with ID3 wrapper / WAV)
+    if header_buf.starts_with(b"ID3") && header_buf.len() >= 10 {
+        for frame_id in [b"TCON", b"TIT1", b"TIT3", b"GRP1", b"TFLT", b"COMM", b"TXXX"] {
+            for text in extract_id3v2_frame_texts(&header_buf, frame_id) {
+                if let Some(media) = classify_media_metadata_tag(&text) {
+                    return Some(media);
+                }
+            }
+        }
+    }
+
+    // 3. Check MP4 / M4A atoms (`©gen` genre, `pcst` podcast flag)
+    let ext_low = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext_low.as_str(), "m4a" | "mp4" | "aac" | "alac") {
+        if let Some(media) = inspect_mp4_atoms(&header_buf) {
+            return Some(media);
+        }
+    }
+
+    // 4. Check ID3v1 tail (last 128 bytes of MP3)
+    if let Ok(len) = file.metadata().map(|m| m.len()) {
+        if len >= 128 && file.seek(SeekFrom::End(-128)).is_ok() {
+            let mut tail = [0u8; 128];
+            if file.read_exact(&mut tail).is_ok() && &tail[0..3] == b"TAG" {
+                let genre_byte = tail[127];
+                match genre_byte {
+                    33 | 46 | 47 => return Some(SmartMediaType::Instrumental),
+                    26 => return Some(SmartMediaType::Ambient),
+                    183 => return Some(SmartMediaType::Audiobook),
+                    186 => return Some(SmartMediaType::Podcast),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    None
+}
+
+fn extract_ascii_key_values(buf: &[u8], key_upper: &str) -> Vec<String> {
+    let mut results = Vec::new();
+    let key_bytes = key_upper.as_bytes();
+    let klen = key_bytes.len();
+    if buf.len() <= klen + 4 {
+        return results;
+    }
+
+    let mut i = 4;
+    while i + klen <= buf.len() {
+        if buf[i..i + klen].eq_ignore_ascii_case(key_bytes) {
+            // In Vorbis comments, the 4 bytes right before the key store the little-endian u32 comment length
+            let comment_len = u32::from_le_bytes([buf[i - 4], buf[i - 3], buf[i - 2], buf[i - 1]]) as usize;
+            let val_start = i + klen;
+            if comment_len >= klen && comment_len <= 512 && i + comment_len <= buf.len() {
+                let val_end = i + comment_len;
+                let s = String::from_utf8_lossy(&buf[val_start..val_end]).trim().to_string();
+                if !s.is_empty() {
+                    results.push(s);
+                }
+                i = val_end;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    results
+}
+
+fn extract_id3v2_frame_texts(buf: &[u8], frame_id: &[u8; 4]) -> Vec<String> {
+    let mut out = Vec::new();
+    if buf.len() < 14 {
+        return out;
+    }
+    let mut i = 10;
+    while i + 10 < buf.len() {
+        if &buf[i..i + 4] == frame_id {
+            let size_be = u32::from_be_bytes([buf[i + 4], buf[i + 5], buf[i + 6], buf[i + 7]]) as usize;
+            let syncsafe = (((buf[i + 4] as usize) & 0x7F) << 21)
+                | (((buf[i + 5] as usize) & 0x7F) << 14)
+                | (((buf[i + 6] as usize) & 0x7F) << 7)
+                | ((buf[i + 7] as usize) & 0x7F);
+            let frame_len = if size_be > 0 && i + 10 + size_be <= buf.len() {
+                size_be
+            } else {
+                syncsafe
+            };
+            if frame_len > 1 && frame_len <= 1024 && i + 10 + frame_len <= buf.len() {
+                let payload = &buf[i + 10..i + 10 + frame_len];
+                let cleaned: String = payload
+                    .iter()
+                    .copied()
+                    .filter(|&b| b >= 0x20 && b < 0x7F)
+                    .map(char::from)
+                    .collect();
+                if !cleaned.trim().is_empty() {
+                    out.push(cleaned.trim().to_string());
+                }
+            }
+            i += 10 + frame_len.max(1);
+        } else {
+            i += 1;
+        }
+    }
+    out
+}
+
+fn inspect_mp4_atoms(buf: &[u8]) -> Option<SmartMediaType> {
+    // Look for `©gen` data atom text
+    if let Some(pos) = buf.windows(4).position(|w| w == b"\xa9gen") {
+        let slice = &buf[pos.. (pos + 128).min(buf.len())];
+        let text: String = slice
+            .iter()
+            .copied()
+            .filter(|&b| b >= 0x20 && b < 0x7F)
+            .map(char::from)
+            .collect();
+        if let Some(media) = classify_media_metadata_tag(&text) {
+            return Some(media);
+        }
+    }
+    None
+}
+
+/// Classify a genre, comment, or style metadata string into a `SmartMediaType` if it unambiguously
+/// represents instrumental or non-vocal media.
+pub fn classify_media_metadata_tag(raw: &str) -> Option<SmartMediaType> {
+    let norm = normalize(raw);
+    if norm.is_empty() {
+        return None;
+    }
+    let lower = raw.trim().to_lowercase();
+
+    // 1. Podcast
+    if matches!(
+        norm.as_str(),
+        "podcast" | "podcasts" | "talk show" | "talk radio" | "radio podcast"
+    ) || lower.contains("podcast")
+    {
+        return Some(SmartMediaType::Podcast);
+    }
+
+    // 2. Audiobook / Spoken Word
+    if matches!(
+        norm.as_str(),
+        "audiobook"
+            | "audiobooks"
+            | "audio book"
+            | "audio books"
+            | "spoken word"
+            | "speech"
+            | "lecture"
+            | "lectures"
+    ) || lower.contains("audiobook")
+        || lower.contains("spoken word")
+    {
+        return Some(SmartMediaType::Audiobook);
+    }
+
+    // 3. Lo-Fi
+    if matches!(
+        norm.as_str(),
+        "lo fi"
+            | "lofi"
+            | "chillhop"
+            | "lo fi beats"
+            | "lofi beats"
+            | "lo fi hip hop"
+            | "lofi hip hop"
+            | "lofi chill"
+    ) || lower.contains("lo-fi")
+        || lower.contains("lofi")
+        || lower.contains("chillhop")
+    {
+        return Some(SmartMediaType::LoFi);
+    }
+
+    // 4. Ambient / Meditation / White Noise / ASMR
+    if matches!(
+        norm.as_str(),
+        "ambient"
+            | "dark ambient"
+            | "drone"
+            | "soundscape"
+            | "soundscapes"
+            | "meditation"
+            | "white noise"
+            | "asmr"
+            | "nature sounds"
+            | "sleep music"
+            | "binaural"
+    ) {
+        return Some(SmartMediaType::Ambient);
+    }
+
+    // 5. DJ Mix / Continuous Set
+    if matches!(
+        norm.as_str(),
+        "dj mix" | "dj mixes" | "continuous mix" | "live set" | "boiler room"
+    ) {
+        return Some(SmartMediaType::DjMix);
+    }
+
+    // 6. Instrumental
+    if matches!(
+        norm.as_str(),
+        "instrumental"
+            | "instrumentals"
+            | "instrumental pop"
+            | "instrumental rock"
+            | "instrumental hip hop"
+            | "off vocal"
+            | "karaoke"
+            | "backing track"
+            | "classical"
+            | "piano solo"
+            | "orchestral"
+            | "symphony"
+            | "chamber music"
+            | "baroque"
+            | "sonata"
+            | "concerto"
+    ) || lower.contains("instrumental")
+        || lower.contains("off vocal")
+        || lower.contains("纯音乐")
+    {
+        return Some(SmartMediaType::Instrumental);
+    }
+
+    None
+}
+
+fn classify_title_or_album_markers(title: &str, album: Option<&str>) -> Option<SmartMediaType> {
+    for text in [Some(title), album].into_iter().flatten() {
+        let low = text.to_lowercase();
+        if low.contains("(instrumental)")
+            || low.contains("[instrumental]")
+            || low.contains("- instrumental")
+            || low.contains("instrumental version")
+            || low.contains("(off vocal)")
+            || low.contains("[off vocal]")
+            || low.contains("(off-vocal)")
+            || low.contains("(karaoke)")
+            || low.contains("[karaoke]")
+            || low.contains("(inst.)")
+            || low.contains("[inst.]")
+            || low.contains("纯音乐")
+        {
+            return Some(SmartMediaType::Instrumental);
+        }
+        if low.contains("(podcast)") || low.contains("[podcast]") {
+            return Some(SmartMediaType::Podcast);
+        }
+        if low.contains("(audiobook)") || low.contains("[audiobook]") {
+            return Some(SmartMediaType::Audiobook);
+        }
+        if low.contains("(lo-fi)") || low.contains("[lo-fi]") || low.contains("(lofi)") {
+            return Some(SmartMediaType::LoFi);
+        }
+    }
+    None
+}
+
+/// Inspect directory/playlist folder names along `audio_path` (from immediate parent folder up to `root_dir`).
+/// Recognizes non-lyric/instrumental folder names like `"Lo-Fi"`, `"Podcasts"`, `"Instrumental"`,
+/// `"Audiobooks"`, `"Ambient"`, `"OST"`, `"DJ Mixes"`, while ignoring ambiguous or generic folder names.
+pub fn classify_path_directories(audio_path: &Path, root_dir: Option<&Path>) -> Option<SmartMediaType> {
+    let mut cur = audio_path.parent();
+    while let Some(dir) = cur {
+        let Some(name) = dir.file_name().and_then(|s| s.to_str()) else {
+            break;
+        };
+        if let Some(media) = classify_directory_or_playlist_name(name) {
+            return Some(media);
+        }
+        if let Some(root) = root_dir {
+            if dir == root {
+                break;
+            }
+        }
+        cur = dir.parent();
+    }
+    None
+}
+
+pub fn classify_directory_or_playlist_name(folder_name: &str) -> Option<SmartMediaType> {
+    let norm = normalize(folder_name);
+    if norm.is_empty() {
+        return None;
+    }
+
+    let tokens: Vec<&str> = norm.split_whitespace().collect();
+
+    // 1. Podcast folders/playlists
+    if matches!(
+        norm.as_str(),
+        "podcast" | "podcasts" | "talk show" | "talk shows" | "interviews"
+    ) || tokens.contains(&"podcast")
+        || tokens.contains(&"podcasts")
+    {
+        return Some(SmartMediaType::Podcast);
+    }
+
+    // 2. Audiobook / Spoken Word folders/playlists
+    if matches!(
+        norm.as_str(),
+        "audiobook"
+            | "audiobooks"
+            | "audio book"
+            | "audio books"
+            | "spoken word"
+            | "lectures"
+    ) || tokens.contains(&"audiobook")
+        || tokens.contains(&"audiobooks")
+    {
+        return Some(SmartMediaType::Audiobook);
+    }
+
+    // 3. Lo-Fi folders/playlists
+    if matches!(
+        norm.as_str(),
+        "lo fi"
+            | "lofi"
+            | "chillhop"
+            | "lo fi beats"
+            | "lofi beats"
+            | "lo fi hip hop"
+            | "lofi hip hop"
+            | "lofi study"
+            | "lo fi study"
+            | "lofi chill"
+            | "lo fi chill"
+    ) || tokens.contains(&"lofi")
+        || tokens.contains(&"chillhop")
+        || norm.starts_with("lo fi ")
+        || norm.ends_with(" lo fi")
+    {
+        return Some(SmartMediaType::LoFi);
+    }
+
+    // 4. Instrumental folders/playlists
+    if matches!(
+        norm.as_str(),
+        "instrumental"
+            | "instrumentals"
+            | "off vocal"
+            | "karaoke"
+            | "beats"
+            | "type beats"
+            | "backing tracks"
+            | "classical"
+            | "piano"
+            | "piano solo"
+            | "orchestral"
+    ) || tokens.contains(&"instrumental")
+        || tokens.contains(&"instrumentals")
+        || tokens.contains(&"karaoke")
+    {
+        return Some(SmartMediaType::Instrumental);
+    }
+
+    // 5. Ambient / Sleep / White Noise / ASMR folders/playlists
+    if matches!(
+        norm.as_str(),
+        "ambient"
+            | "soundscape"
+            | "soundscapes"
+            | "meditation"
+            | "white noise"
+            | "asmr"
+            | "nature sounds"
+            | "sleep"
+            | "sleep music"
+            | "drone"
+    ) || tokens.contains(&"ambient")
+        || tokens.contains(&"asmr")
+        || tokens.contains(&"soundscapes")
+    {
+        return Some(SmartMediaType::Ambient);
+    }
+
+    // 6. Soundtrack / OST / Score / BGM folders/playlists
+    if matches!(
+        norm.as_str(),
+        "ost"
+            | "osts"
+            | "soundtrack"
+            | "soundtracks"
+            | "original soundtrack"
+            | "game ost"
+            | "anime ost"
+            | "film score"
+            | "score"
+            | "bgm"
+    ) || tokens.contains(&"bgm")
+    {
+        return Some(SmartMediaType::Soundtrack);
+    }
+
+    // 7. DJ Mix / Live Set folders/playlists
+    if matches!(
+        norm.as_str(),
+        "dj mix" | "dj mixes" | "mixes" | "live set" | "live sets" | "boiler room"
+    ) {
+        return Some(SmartMediaType::DjMix);
+    }
+
+    None
 }
 
 fn score_candidate(entry: &IndexedLrc, query: &TrackQuery, url_stem: Option<&str>) -> f64 {
@@ -1485,6 +2071,7 @@ mod tests {
             artists: vec!["Queen".to_string()],
             album: Some("A Night at the Opera".to_string()),
             url: None,
+            ..Default::default()
         };
         let m1 = matcher.find_best_match(&q1).expect("Should match Queen LRC");
         assert_eq!(m1.path, lrc_queen);
@@ -1495,6 +2082,7 @@ mod tests {
             artists: vec!["M83".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         let m2 = matcher.find_best_match(&q2).expect("Should match M83 LRC");
         assert_eq!(m2.path, lrc_m83);
@@ -1505,6 +2093,7 @@ mod tests {
             artists: vec!["Muse".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         let m3 = matcher
             .find_best_match(&q3)
@@ -1531,6 +2120,7 @@ mod tests {
             artists: vec![],
             album: None,
             url: Some(format!("file://{}", audio.display())),
+            ..Default::default()
         };
         assert_eq!(find_sibling_lrc(&q_sib), Some(sibling));
         let _ = fs::remove_dir_all(&temp_dir);
@@ -1541,6 +2131,7 @@ mod tests {
             artists: vec!["DJMAX ARCHIVE".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         let cleaned = clean_video_metadata(&q_djmax);
         assert_eq!(cleaned.title, "Crazy (feat. Yina)");
@@ -1556,6 +2147,7 @@ mod tests {
             artists: vec!["Some Uploader Channel".to_string()],
             album: Some("YouTube".to_string()),
             url: None,
+            ..Default::default()
         };
         let cleaned2 = clean_video_metadata(&q_collab);
         assert_eq!(cleaned2.title, "Song");
@@ -1579,6 +2171,7 @@ mod tests {
             artists: vec!["Daft Punk".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         let mut fetched = ParsedLrc::parse("[00:12.34]Last night I had a dream about you\n[00:16.50]In this dream I'm dancing right beside you\n");
         fetched.match_score = 0.78;
@@ -1618,6 +2211,7 @@ mod tests {
             artists: vec!["Host".to_string()],
             album: None,
             url: Some(format!("file://{}", bl_audio.display())),
+            ..Default::default()
         };
         assert!(bl_matcher.is_track_blacklisted(&q_bl));
         assert!(!bl_matcher.is_track_blacklisted(&q_save));
@@ -1662,6 +2256,7 @@ mod tests {
                 "file://{}",
                 dir_dave.join("01 - Starlight.flac").display()
             )),
+            ..Default::default()
         };
         assert!(
             matcher.find_best_match(&q_dave).is_none(),
@@ -1674,6 +2269,7 @@ mod tests {
             artists: vec!["Drake".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         assert!(matcher.find_best_match(&q_drake).is_none());
         assert_eq!(artist_match_score(&q_dave, "Drake"), 0.0);
@@ -1684,6 +2280,7 @@ mod tests {
             artists: vec!["Three Doors Down".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         assert!(
             matcher.find_best_match(&q_tdd).is_none(),
@@ -1696,6 +2293,7 @@ mod tests {
             artists: vec!["Muse".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         assert_eq!(
             matcher.find_best_match(&q_muse).map(|m| m.path),
@@ -1708,11 +2306,71 @@ mod tests {
             artists: vec!["Three Days Grace".to_string()],
             album: None,
             url: None,
+            ..Default::default()
         };
         assert_eq!(
             matcher.find_best_match(&q_tdg).map(|m| m.path),
             Some(lrc_tdg)
         );
+
+        // 6. Smart Identification via metadata and directory names
+        let lofi_dir = temp_dir.join("Lo-Fi");
+        let pod_dir = temp_dir.join("Podcasts");
+        let generic_dir = temp_dir.join("My Playlist");
+        fs::create_dir_all(&lofi_dir).unwrap();
+        fs::create_dir_all(&pod_dir).unwrap();
+        fs::create_dir_all(&generic_dir).unwrap();
+        let lofi_file = lofi_dir.join("rainy_beats.flac");
+        let pod_file = pod_dir.join("ep42.mp3");
+        let generic_file = generic_dir.join("regular_song.flac");
+        fs::write(&lofi_file, b"fake").unwrap();
+        fs::write(&pod_file, b"fake").unwrap();
+        fs::write(&generic_file, b"fake").unwrap();
+
+        let q_lofi = TrackQuery {
+            title: "Rainy Study".to_string(),
+            artists: vec!["ChilledCow".to_string()],
+            url: Some(format!("file://{}", lofi_file.display())),
+            ..Default::default()
+        };
+        assert_eq!(
+            matcher.smart_identify_track(&q_lofi),
+            Some(SmartMediaType::LoFi)
+        );
+
+        let q_pod = TrackQuery {
+            title: "Episode 42".to_string(),
+            artists: vec!["Host".to_string()],
+            url: Some(format!("file://{}", pod_file.display())),
+            ..Default::default()
+        };
+        assert_eq!(
+            matcher.smart_identify_track(&q_pod),
+            Some(SmartMediaType::Podcast)
+        );
+
+        // Metadata takes priority over ambiguous directory name
+        let q_meta_inst = TrackQuery {
+            title: "Mystery Track".to_string(),
+            artists: vec!["Artist".to_string()],
+            url: Some(format!("file://{}", generic_file.display())),
+            genres: vec!["Instrumental".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(
+            matcher.smart_identify_track(&q_meta_inst),
+            Some(SmartMediaType::Instrumental)
+        );
+
+        // Ambiguous folder + regular genre returns None so lyrics search runs normally
+        let q_regular = TrackQuery {
+            title: "Regular Song".to_string(),
+            artists: vec!["Artist".to_string()],
+            url: Some(format!("file://{}", generic_file.display())),
+            genres: vec!["Rock".to_string()],
+            ..Default::default()
+        };
+        assert_eq!(matcher.smart_identify_track(&q_regular), None);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

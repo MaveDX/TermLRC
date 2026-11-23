@@ -73,4 +73,8 @@ pub struct Cli {
     /// Automatically rescan remote providers when a local `.lrc` file fails lyrics verification (overrides config.toml).
     #[arg(long = "rescan-failed", alias = "rescan-failed-lyrics")]
     pub rescan_failed_lyrics: Option<bool>,
+
+    /// Enable or disable Smart Identification of instrumental/non-lyric media via metadata and folder names (overrides config.toml).
+    #[arg(long = "smart-identification", alias = "smart-id")]
+    pub smart_identification: Option<bool>,
 }

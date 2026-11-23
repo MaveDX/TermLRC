@@ -90,6 +90,8 @@ pub struct Settings {
     pub blacklist_dirs: Vec<String>,
     #[serde(alias = "disabled_text", alias = "blacklist_text")]
     pub lyrics_disabled_text: String,
+    #[serde(alias = "smart_id", alias = "smart_media_identification")]
+    pub smart_identification: bool,
     pub verify_lyrics: bool,
     #[serde(alias = "rescan_invalid_lyrics")]
     pub rescan_failed_lyrics: bool,
@@ -151,6 +153,7 @@ impl Default for Settings {
             mpris_poll_ms: 250,
             blacklist_dirs: Vec::new(),
             lyrics_disabled_text: String::from("Lyrics Disabled"),
+            smart_identification: true,
             verify_lyrics: true,
             rescan_failed_lyrics: true,
             match_threshold: 0.62,
@@ -299,6 +302,9 @@ impl Settings {
         }
         if let Some(rescan_failed) = cli.rescan_failed_lyrics {
             self.rescan_failed_lyrics = rescan_failed;
+        }
+        if let Some(smart_id) = cli.smart_identification {
+            self.smart_identification = smart_id;
         }
         *self = self.clone().sanitized();
     }

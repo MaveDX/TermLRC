@@ -275,6 +275,16 @@ fn read_metadata(proxy: &Proxy<'_>) -> (TrackQuery, Option<Duration>) {
 
     let url = xesam_url.or(track_id);
 
+    let genres = map
+        .get("xesam:genre")
+        .map(extract_string_list)
+        .unwrap_or_default();
+
+    let comments = map
+        .get("xesam:comment")
+        .map(extract_string_list)
+        .unwrap_or_default();
+
     let length = map.get("mpris:length").and_then(extract_duration_micros);
 
     (
@@ -283,6 +293,8 @@ fn read_metadata(proxy: &Proxy<'_>) -> (TrackQuery, Option<Duration>) {
             artists,
             album,
             url,
+            genres,
+            comments,
         },
         length,
     )

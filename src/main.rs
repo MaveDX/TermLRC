@@ -22,9 +22,9 @@ use crossterm::{
 };
 use kitty::KittyRenderer;
 use lrc::{LyricSyncState, ParsedLrc};
-use matcher::{find_sibling_lrc, LrcMatcher, TrackQuery};
+use matcher::{find_sibling_lrc, LrcMatcher, SmartMediaType, TrackQuery};
 use player::MprisTracker;
-use providers::{retry_backoff_duration, FallbackEvent, FallbackWorker, LookupStatus};
+use providers::{FallbackEvent, FallbackWorker, LookupStatus};
 use ratatui::{backend::CrosstermBackend, Terminal};
 use std::{
     fs,
@@ -48,8 +48,10 @@ struct App {
     current_lrc_path: Option<PathBuf>,
     current_lrc_mtime: Option<SystemTime>,
     last_local_hot_reload_check: Instant,
-    retry_attempt: u32,
-    next_retry_at: Option<Instant>,
+    /// Ensures TermLRC searches for lyrics only once per track play instead of repeatedly retrying.
+    has_searched_current_play: bool,
+    /// Tracks maximum playback position reached during the current play to detect track replay/restart.
+    max_position_in_play: Duration,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,8 +87,8 @@ impl App {
             current_lrc_path: None,
             current_lrc_mtime: None,
             last_local_hot_reload_check: Instant::now(),
-            retry_attempt: 0,
-            next_retry_at: None,
+            has_searched_current_play: false,
+            max_position_in_play: Duration::ZERO,
         }
     }
 
@@ -99,12 +101,11 @@ impl App {
         self.current_lrc_path = Some(path);
         self.current_lrc = Some(parsed);
         self.ui.lookup_status = LookupStatus::Idle;
-        self.retry_attempt = 0;
-        self.next_retry_at = None;
+        self.has_searched_current_play = true;
         self.kitty.invalidate();
     }
 
-    fn try_load_local_lrc(&mut self) -> LocalLoadOutcome {
+    fn try_load_local_lrc(&mut self, allow_rescan: bool) -> LocalLoadOutcome {
         let verify_lyrics = self.settings_mgr.settings().verify_lyrics;
         let rescan_failed = self.settings_mgr.settings().rescan_failed_lyrics;
         let mut saw_failed_verification = false;
@@ -132,7 +133,12 @@ impl App {
         }
 
         // 2. Recursive `lyrics_dir` search
-        if let Some(m) = self.matcher.find_best_match(&self.current_query) {
+        let matched = if allow_rescan {
+            self.matcher.find_best_match(&self.current_query)
+        } else {
+            self.matcher.find_best_match_no_rescan(&self.current_query)
+        };
+        if let Some(m) = matched {
             if let Ok(mut parsed) = ParsedLrc::from_file(&m.path) {
                 let identity_ok = parsed.matches_track_identity(&self.current_query);
                 let is_valid = identity_ok
@@ -163,8 +169,7 @@ impl App {
 
     fn force_rescan_and_match(&mut self) {
         self.matcher.rescan();
-        self.retry_attempt = 0;
-        self.next_retry_at = None;
+        self.has_searched_current_play = false;
         self.match_current_track(true, true);
     }
 
@@ -175,30 +180,45 @@ impl App {
             self.current_lrc_path = None;
             self.current_lrc_mtime = None;
             self.ui.lookup_status = LookupStatus::Idle;
-            self.retry_attempt = 0;
-            self.next_retry_at = None;
+            self.has_searched_current_play = false;
+            self.max_position_in_play = Duration::ZERO;
             return;
         }
 
-        // Check if the playing track originates from a blacklisted directory
+        self.has_searched_current_play = true;
+
+        // 1. Check if the playing track originates from a blacklisted directory
         if self.matcher.is_track_blacklisted(&self.current_query) {
             self.current_lrc = None;
             self.current_lrc_path = None;
             self.current_lrc_mtime = None;
             self.ui.lookup_status = LookupStatus::Disabled;
-            self.retry_attempt = 0;
-            self.next_retry_at = None;
             return;
         }
 
         self.ui.lookup_status = LookupStatus::Searching;
 
-        let local_outcome = self.try_load_local_lrc();
+        // 2. Always check for an existing valid local `.lrc` file first
+        let local_outcome = self.try_load_local_lrc(true);
         if local_outcome == LocalLoadOutcome::Loaded {
             return;
         }
 
         let settings = self.settings_mgr.settings().clone();
+
+        // 3. Smart Identification: if local lyrics are unavailable, check if the track's embedded
+        //    file tags, MPRIS metadata, or directory/playlist name identify it as instrumental
+        //    or non-vocal media (e.g. "Lo-Fi", "Podcast", "Instrumental", "Audiobook", "Ambient").
+        if settings.smart_identification {
+            if let Some(media_type) = self.matcher.smart_identify_track(&self.current_query) {
+                self.current_lrc = None;
+                self.current_lrc_path = None;
+                self.current_lrc_mtime = None;
+                self.ui.lookup_status = LookupStatus::SmartMedia(media_type);
+                return;
+            }
+        }
+
         if local_outcome == LocalLoadOutcome::FailedVerification && !settings.rescan_failed_lyrics {
             self.current_lrc = None;
             self.current_lrc_path = None;
@@ -207,8 +227,8 @@ impl App {
             return;
         }
 
-        // Local match not found (or failed verification with `rescan_failed_lyrics = true`):
-        // dispatch remote fallback chain in priority order
+        // 4. Local match not found and media is a regular song:
+        //    dispatch remote fallback chain ONCE for this play.
         if !preserve_existing_on_pending {
             self.current_lrc = None;
             self.current_lrc_path = None;
@@ -231,6 +251,7 @@ impl App {
 
     /// Periodically check if a local `.lrc` file was newly downloaded or modified on disk
     /// so lyrics hot-reload immediately without needing to switch songs.
+    /// Does not trigger network requests or full directory rescans.
     fn poll_local_lrc_hot_reload(&mut self) {
         if self.last_local_hot_reload_check.elapsed() < Duration::from_millis(750) {
             return;
@@ -251,11 +272,12 @@ impl App {
             if let Ok(mtime) = fs::metadata(path).and_then(|m| m.modified()) {
                 if self.current_lrc_mtime != Some(mtime) {
                     if let Ok(mut parsed) = ParsedLrc::from_file(path) {
-                        let valid = if verify_lyrics {
-                            parsed.verify_and_clean()
-                        } else {
-                            parsed.is_strictly_synced()
-                        };
+                        let valid = parsed.matches_track_identity(&self.current_query)
+                            && if verify_lyrics {
+                                parsed.verify_and_clean()
+                            } else {
+                                parsed.is_strictly_synced()
+                            };
                         if valid {
                             self.set_local_lrc(path.clone(), parsed);
                         }
@@ -265,9 +287,9 @@ impl App {
             return;
         }
 
-        // Case 2: No local `.lrc` was loaded yet (either waiting/not found or showing remote lyrics)
-        // Check if a sibling `.lrc` or new `.lrc` in `lyrics_dir` has appeared on disk
-        if self.try_load_local_lrc() == LocalLoadOutcome::Loaded {
+        // Case 2: No local `.lrc` was loaded yet — check if a sibling `.lrc` or indexed `.lrc` appeared
+        // without rescanning or re-triggering remote lookups
+        if self.try_load_local_lrc(false) == LocalLoadOutcome::Loaded {
             self.kitty.invalidate();
         }
     }
@@ -294,6 +316,7 @@ impl App {
                 .matcher
                 .update_config(new_dir, updated.match_threshold, new_blacklist)
             {
+                self.has_searched_current_play = false;
                 self.match_current_track(true, false);
             }
         }
@@ -308,17 +331,30 @@ impl App {
             self.current_query = snap.query.clone();
             self.current_track_length = snap.length;
 
-            // Small duration or album updates do not invalidate found lyrics
-            if is_minor_update && self.current_lrc.is_some() {
-                // Keep current_lrc intact
+            // Search only once per play: minor metadata/duration updates on the same playing track
+            // never re-trigger a search after the track has already been searched once.
+            if is_minor_update && self.has_searched_current_play {
+                // Keep existing state (whether lyrics were found or the single search completed/failed)
             } else {
                 self.ui.reset_for_new_track();
-                self.retry_attempt = 0;
-                self.next_retry_at = None;
+                self.has_searched_current_play = false;
+                self.max_position_in_play = snap.position;
                 self.match_current_track(false, false);
             }
         } else {
             self.current_track_length = snap.length;
+            // Detect if the user replayed/restarted the same track from the beginning
+            if snap.position > self.max_position_in_play {
+                self.max_position_in_play = snap.position;
+            } else if self.max_position_in_play > Duration::from_secs(15)
+                && snap.position < Duration::from_secs(2)
+            {
+                self.max_position_in_play = snap.position;
+                if self.current_lrc.is_none() {
+                    self.has_searched_current_play = false;
+                    self.match_current_track(false, false);
+                }
+            }
         }
 
         // Drain status and completion events from the background fallback worker
@@ -330,6 +366,7 @@ impl App {
                     {
                         if self.current_lrc.is_none()
                             && self.ui.lookup_status != LookupStatus::Disabled
+                            && !matches!(self.ui.lookup_status, LookupStatus::SmartMedia(_))
                         {
                             self.ui.lookup_status = status;
                             self.kitty.invalidate();
@@ -340,6 +377,7 @@ impl App {
                     query,
                     lrc,
                     rate_limited,
+                    detected_instrumental,
                 } => {
                     if (query.is_same_track(&self.current_query, None, None)
                         || query == self.current_query)
@@ -382,19 +420,17 @@ impl App {
                                 self.current_lrc_mtime = None;
                                 self.current_lrc = Some(fetched_lrc);
                                 self.ui.lookup_status = LookupStatus::Idle;
-                                self.retry_attempt = 0;
-                                self.next_retry_at = None;
                                 self.kitty.invalidate();
                             }
                         } else if self.current_lrc.is_none() {
-                            self.ui.lookup_status = if rate_limited {
+                            let smart_id = self.settings_mgr.settings().smart_identification;
+                            self.ui.lookup_status = if smart_id && detected_instrumental {
+                                LookupStatus::SmartMedia(SmartMediaType::Instrumental)
+                            } else if rate_limited {
                                 LookupStatus::RateLimited
                             } else {
                                 LookupStatus::NotFound
                             };
-                            let delay = retry_backoff_duration(self.retry_attempt);
-                            self.retry_attempt = self.retry_attempt.saturating_add(1);
-                            self.next_retry_at = Some(Instant::now() + delay);
                             self.kitty.invalidate();
                         }
                     }
@@ -404,29 +440,6 @@ impl App {
 
         // Check for newly downloaded or modified local `.lrc` files on disk
         self.poll_local_lrc_hot_reload();
-
-        // Trigger scheduled retry if lookup previously failed and backoff timer elapsed
-        if self.current_lrc.is_none()
-            && !self.current_query.is_empty()
-            && self.ui.lookup_status != LookupStatus::Disabled
-        {
-            if let Some(retry_at) = self.next_retry_at {
-                if Instant::now() >= retry_at {
-                    self.next_retry_at = None;
-                    let settings = self.settings_mgr.settings().clone();
-                    if !settings.enabled_fallback_providers().is_empty() {
-                        self.ui.lookup_status = LookupStatus::Searching;
-                        self.kitty.invalidate();
-                        self.fallback_worker.request(
-                            self.current_query.clone(),
-                            self.current_track_length,
-                            settings,
-                            false,
-                        );
-                    }
-                }
-            }
-        }
 
         let sync = match &self.current_lrc {
             Some(lrc) => lrc.sync_state(snap.position, self.ui.user_offset_ms),

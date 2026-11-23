@@ -191,6 +191,7 @@ impl KittyRenderer {
             LookupStatus::RateLimited => (3u8, 0u8),
             LookupStatus::NotFound => (4u8, 0u8),
             LookupStatus::Disabled => (5u8, 0u8),
+            LookupStatus::SmartMedia(kind) => (kind.tag_code(), 0u8),
         };
 
         let scroll_px = ui.scroll_line * ui.pixel_line_spacing as f64;
@@ -519,6 +520,7 @@ fn draw_pixel_lyrics(
                     LookupStatus::RateLimited => "Rate limited",
                     LookupStatus::NotFound => "Lyrics not found",
                     LookupStatus::Disabled => ui.lyrics_disabled_text.as_str(),
+                    LookupStatus::SmartMedia(kind) => kind.status_label(),
                     LookupStatus::Downloading { .. } => "Downloading",
                 };
                 if !msg.is_empty() {

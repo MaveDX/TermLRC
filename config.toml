@@ -118,6 +118,12 @@ blacklist_dirs = []
 # Customizable status text displayed when music is playing from a blacklisted directory
 lyrics_disabled_text = "Lyrics Disabled"
 
+# Smart Identification: automatically detect instrumental or non-vocal media (such as "Instrumental",
+# "Lo-Fi", "Podcast", "Audiobook", "Ambient", "DJ Mix") from embedded audio file tags, MPRIS metadata,
+# remote provider flags, and directory/playlist folder names. When local lyrics are unavailable for
+# identified non-vocal media, displays the media type instead of searching for lyrics.
+smart_identification = true
+
 # Verify lyrics and filter out bogus metadata-only / Chinese artist-credit placeholders
 # (such as "作曲 : ...", "作词 : ...", "纯音乐，请欣赏") that contain no actual song lyrics
 verify_lyrics = true

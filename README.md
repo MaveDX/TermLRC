@@ -54,9 +54,10 @@ inactive_lyric_buffer_px = 10.0
 alignment = "left"
 show_lyrics_source = true
 
-# Directory Blacklist & Lyrics Verification
+# Directory Blacklist, Smart Identification & Lyrics Verification
 blacklist_dirs = []
 lyrics_disabled_text = "Lyrics Disabled"
+smart_identification = true
 verify_lyrics = true
 rescan_failed_lyrics = true
 

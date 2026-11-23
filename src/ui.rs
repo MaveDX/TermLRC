@@ -227,6 +227,7 @@ pub fn draw(frame: &mut Frame, lrc: Option<&ParsedLrc>, sync: &LyricSyncState, u
                     LookupStatus::RateLimited => "Rate limited",
                     LookupStatus::NotFound => "Lyrics not found",
                     LookupStatus::Disabled => ui.lyrics_disabled_text.as_str(),
+                    LookupStatus::SmartMedia(kind) => kind.status_label(),
                     LookupStatus::Downloading { .. } => "Downloading",
                 };
                 if !msg.is_empty() {
